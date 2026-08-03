@@ -1,0 +1,19 @@
+# SwiftPM build products and locally packaged app bundles
+.build/
+dist/
+
+# Finder and Xcode user-specific files
+.DS_Store
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Project-local personal configuration, if ever added
+.local/
+local/
+FolderDock.local.*
+*.local.json
+
+# Saved folder sets are stored by macOS in User Defaults, outside this repository.
