@@ -15,6 +15,10 @@ Saved folders are stored locally in the app's User Defaults. Click a folder to o
 
 When browsing a saved folder, click once to select an item and double-click to open it.
 
+You can drag any saved folder or browser item directly into another app, including file-upload targets. Dragging a folder back onto the saved-folder shelf adds it to the active folder set.
+
+Drag files or folders from Finder onto the open browser to move them into that folder, or onto a folder tile to move them into that specific folder. Hold `Option` while dropping to copy instead.
+
 - `⌘[` / `⌘]` or Logitech MX side buttons: back / forward
 - `⌘↑`: enclosing folder
 - `Return` or `⌘O`: open the selected item
@@ -24,3 +28,4 @@ When browsing a saved folder, click once to select an item and double-click to o
 - `⌘N`: open the current folder in Finder
 - `⌘W`: return to the folder shelf
 - `⌥⌘←` / `⌥⌘→`: previous / next folder set
+- `⌘C`, `⌘D`, `⌘I`, `⌘Delete`: copy, duplicate, get info, move selected item to Trash

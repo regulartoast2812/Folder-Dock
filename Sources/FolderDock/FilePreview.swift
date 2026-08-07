@@ -33,18 +33,43 @@ final class ThumbnailLoader: ObservableObject {
     @Published private(set) var image: NSImage?
 
     init(url: URL, size: CGFloat) {
+        let key = ThumbnailCache.key(for: url, size: size)
+        if let cachedImage = ThumbnailCache.images.object(forKey: key as NSString) {
+            image = cachedImage
+            return
+        }
+
         let scale = NSScreen.main?.backingScaleFactor ?? 2
         let request = QLThumbnailGenerator.Request(
             fileAt: url,
-            size: NSSize(width: size * scale, height: size * scale),
+            // `size` is already in points; multiplying it by scale here requested a
+            // 4×-larger image on Retina displays and made video previews needlessly slow.
+            size: NSSize(width: size, height: size),
             scale: scale,
-            representationTypes: .thumbnail
+            representationTypes: .lowQualityThumbnail
         )
         QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { [weak self] thumbnail, _ in
             guard let image = thumbnail?.nsImage else { return }
             DispatchQueue.main.async {
+                ThumbnailCache.images.setObject(image, forKey: key as NSString, cost: Int(size * size * scale * scale * 4))
                 self?.image = image
             }
         }
+    }
+}
+
+@MainActor
+private enum ThumbnailCache {
+    static let images: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 300
+        cache.totalCostLimit = 48 * 1024 * 1024
+        return cache
+    }()
+
+    static func key(for url: URL, size: CGFloat) -> String {
+        let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?
+            .timeIntervalSinceReferenceDate ?? 0
+        return "\(url.path)|\(modified)|\(size)"
     }
 }

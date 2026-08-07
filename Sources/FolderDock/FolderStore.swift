@@ -112,9 +112,13 @@ final class FolderStore: ObservableObject {
     }
 
     func add(url: URL) {
+        add(url: url, toSetID: selectedSetID)
+    }
+
+    func add(url: URL, toSetID setID: UUID) {
         let url = url.standardizedFileURL
         guard url.hasDirectoryPath,
-              let index = folderSets.firstIndex(where: { $0.id == selectedSetID }),
+              let index = folderSets.firstIndex(where: { $0.id == setID }),
               !folderSets[index].folders.contains(where: { $0.path == url.path }) else { return }
         folderSets[index].folders.append(SavedFolder(url: url))
         persist()
@@ -123,6 +127,27 @@ final class FolderStore: ObservableObject {
     func remove(_ folder: SavedFolder) {
         guard let index = folderSets.firstIndex(where: { $0.id == selectedSetID }) else { return }
         folderSets[index].folders.removeAll { $0.id == folder.id }
+        persist()
+    }
+
+    func moveSet(_ movingID: UUID, before targetID: UUID) {
+        guard movingID != targetID,
+              let source = folderSets.firstIndex(where: { $0.id == movingID }),
+              let target = folderSets.firstIndex(where: { $0.id == targetID }) else { return }
+        let set = folderSets.remove(at: source)
+        let destination = source < target ? target - 1 : target
+        folderSets.insert(set, at: destination)
+        persist()
+    }
+
+    func moveFolder(_ movingID: UUID, before targetID: UUID) {
+        guard movingID != targetID,
+              let setIndex = folderSets.firstIndex(where: { $0.id == selectedSetID }),
+              let source = folderSets[setIndex].folders.firstIndex(where: { $0.id == movingID }),
+              let target = folderSets[setIndex].folders.firstIndex(where: { $0.id == targetID }) else { return }
+        let folder = folderSets[setIndex].folders.remove(at: source)
+        let destination = source < target ? target - 1 : target
+        folderSets[setIndex].folders.insert(folder, at: destination)
         persist()
     }
 
