@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import QuickLookUI
 import SwiftUI
 
@@ -21,7 +22,8 @@ enum DockPrompt: Identifiable {
 @MainActor
 final class DockController: ObservableObject {
     private let store: FolderStore
-    private var panel: NSPanel?
+    private var shelfPanel: DockPanel?
+    private var browserPanel: DockPanel?
     private var hoverTimer: Timer?
     private var dismissalWorkItem: DispatchWorkItem?
     private var shortcutEventMonitor: Any?
@@ -29,6 +31,10 @@ final class DockController: ObservableObject {
     private let quickLookController = QuickLookPreviewController()
     private var hasStarted = false
     private var isInteractionLocked = false
+    private var shelfResizeBaseWidth: CGFloat?
+    private var shelfResizeStartMouseX: CGFloat?
+    private var browserResizeBaseSize: NSSize?
+    private var browserResizeStartMouse: NSPoint?
     private var navigationHistory: [URL] = []
     private var historyIndex = -1
     @Published private(set) var currentFolder: URL?
@@ -77,15 +83,21 @@ final class DockController: ObservableObject {
 
     func show() {
         cancelDismissal()
-        let panel = makePanelIfNeeded()
-        position(panel)
-        panel.orderFrontRegardless()
+        let shelf = makeShelfPanelIfNeeded()
+        positionShelf(shelf)
+        shelf.orderFrontRegardless()
+        if currentFolder != nil || isManagingSets {
+            let browser = makeBrowserPanelIfNeeded()
+            positionBrowser(browser, below: shelf)
+            browser.orderFrontRegardless()
+        }
     }
 
     func hide() {
         cancelDismissal()
         isInteractionLocked = false
-        panel?.orderOut(nil)
+        shelfPanel?.orderOut(nil)
+        browserPanel?.orderOut(nil)
     }
 
     func handleEscape() {
@@ -99,6 +111,64 @@ final class DockController: ObservableObject {
     func keepOpen() {
         isInteractionLocked = true
         cancelDismissal()
+    }
+
+    func beginShelfResize() {
+        guard let shelfPanel else { return }
+        keepOpen()
+        shelfResizeBaseWidth = shelfPanel.frame.width
+        shelfResizeStartMouseX = NSEvent.mouseLocation.x
+    }
+
+    func updateShelfResize(fromLeadingEdge: Bool) {
+        guard let panel = shelfPanel, let startMouseX = shelfResizeStartMouseX else { return }
+        let baseWidth = shelfResizeBaseWidth ?? panel.frame.width
+        let mouseDelta = NSEvent.mouseLocation.x - startMouseX
+        let directionalTranslation = fromLeadingEdge ? -mouseDelta : mouseDelta
+        panel.setContentSize(NSSize(width: max(360, baseWidth + directionalTranslation * 2), height: 100))
+        positionShelf(panel)
+        if let browser = browserPanel, browser.isVisible {
+            positionBrowser(browser, below: panel)
+        }
+    }
+
+    func endShelfResize() {
+        guard let panel = shelfPanel else { return }
+        shelfResizeBaseWidth = nil
+        shelfResizeStartMouseX = nil
+        UserDefaults.standard.set(panel.frame.width, forKey: "dockShelfWidth")
+        positionShelf(panel)
+    }
+
+    func beginBrowserResize() {
+        guard let browserPanel else { return }
+        keepOpen()
+        browserResizeBaseSize = browserPanel.frame.size
+        browserResizeStartMouse = NSEvent.mouseLocation
+    }
+
+    func updateBrowserResize(fromLeadingEdge: Bool) {
+        guard let panel = browserPanel,
+              let shelf = shelfPanel,
+              let startMouse = browserResizeStartMouse else { return }
+        let baseSize = browserResizeBaseSize ?? panel.frame.size
+        let mouseDeltaX = NSEvent.mouseLocation.x - startMouse.x
+        let directionalTranslation = fromLeadingEdge ? -mouseDeltaX : mouseDeltaX
+        let downwardMouseDelta = startMouse.y - NSEvent.mouseLocation.y
+        panel.setContentSize(NSSize(
+            width: max(520, baseSize.width + directionalTranslation * 2),
+            height: max(300, baseSize.height + downwardMouseDelta)
+        ))
+        positionBrowser(panel, below: shelf)
+    }
+
+    func endBrowserResize() {
+        guard let panel = browserPanel, let shelf = shelfPanel else { return }
+        browserResizeBaseSize = nil
+        browserResizeStartMouse = nil
+        UserDefaults.standard.set(panel.frame.width, forKey: "dockBrowserWidth")
+        UserDefaults.standard.set(panel.frame.height, forKey: "dockBrowserHeight")
+        positionBrowser(panel, below: shelf)
     }
 
     func chooseFolders() {
@@ -140,7 +210,6 @@ final class DockController: ObservableObject {
         historyIndex = 0
         currentFolder = folder.url
         clearSelection()
-        resizePanel(for: .browser)
         show()
         activateForInput()
     }
@@ -313,13 +382,16 @@ final class DockController: ObservableObject {
         // Finder stores tags in this binary property-list extended attribute on
         // macOS releases before URLResourceValues exposes a writable tag API.
         let data = try PropertyListSerialization.data(fromPropertyList: tags, format: .binary, options: 0)
-        let hex = data.map { String(format: "%02x", $0) }.joined()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
-        process.arguments = ["-w", "-x", "com.apple.metadata:_kMDItemUserTags", hex, url.path]
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
+        let attribute = "com.apple.metadata:_kMDItemUserTags"
+        let result = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return attribute.withCString { name in
+                data.withUnsafeBytes { bytes in
+                    setxattr(path, name, bytes.baseAddress, data.count, 0, 0)
+                }
+            }
+        }
+        guard result == 0 else {
             throw FinderTagWriteError.failed(url.lastPathComponent)
         }
     }
@@ -551,7 +623,7 @@ final class DockController: ObservableObject {
         currentFolder = nil
         isManagingSets = false
         clearSelection()
-        resizePanel(for: .shelf)
+        browserPanel?.orderOut(nil)
         show()
     }
 
@@ -560,18 +632,48 @@ final class DockController: ObservableObject {
         historyIndex = -1
         currentFolder = nil
         isManagingSets = true
-        resizePanel(for: .browser)
         show()
         // The shelf itself stays non-activating, but set management needs keyboard focus.
         activateForInput()
     }
 
-    private func makePanelIfNeeded() -> NSPanel {
-        if let panel { return panel }
+    private func makeShelfPanelIfNeeded() -> DockPanel {
+        if let shelfPanel { return shelfPanel }
+        let panel = makePanel(size: savedShelfSize(), fixedHeight: 100)
+        panel.contentMinSize = NSSize(width: 360, height: 100)
+        panel.contentMaxSize = NSSize(width: 2_400, height: 100)
+        panel.resizeEndedAction = { [weak self, weak panel] in
+            guard let self, let panel else { return }
+            UserDefaults.standard.set(panel.frame.width, forKey: "dockShelfWidth")
+            self.positionShelf(panel)
+            if let browser = self.browserPanel, browser.isVisible {
+                self.positionBrowser(browser, below: panel)
+            }
+        }
+        panel.contentView = NSHostingView(rootView: DockView(store: store, controller: self))
+        shelfPanel = panel
+        return panel
+    }
 
-        let initialSize = PanelMode.shelf.size
+    private func makeBrowserPanelIfNeeded() -> DockPanel {
+        if let browserPanel { return browserPanel }
+        let panel = makePanel(size: savedBrowserSize(), fixedHeight: nil)
+        panel.contentMinSize = NSSize(width: 520, height: 300)
+        panel.contentMaxSize = NSSize(width: 2_400, height: 1_600)
+        panel.resizeEndedAction = { [weak self, weak panel] in
+            guard let self, let panel, let shelf = self.shelfPanel else { return }
+            UserDefaults.standard.set(panel.frame.width, forKey: "dockBrowserWidth")
+            UserDefaults.standard.set(panel.frame.height, forKey: "dockBrowserHeight")
+            self.positionBrowser(panel, below: shelf)
+        }
+        panel.contentView = NSHostingView(rootView: DockBrowserView(store: store, controller: self))
+        browserPanel = panel
+        return panel
+    }
+
+    private func makePanel(size: NSSize, fixedHeight: CGFloat?) -> DockPanel {
         let panel = DockPanel(
-            contentRect: NSRect(origin: .zero, size: initialSize),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -584,27 +686,22 @@ final class DockController: ObservableObject {
         panel.hasShadow = true
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = true
+        panel.isMovable = false
+        panel.isMovableByWindowBackground = false
+        panel.fixedContentHeight = fixedHeight
         panel.escapeAction = { [weak self] in self?.handleEscape() }
-        panel.contentView = NSHostingView(rootView: DockView(store: store, controller: self))
-        self.panel = panel
         return panel
     }
 
-    private enum PanelMode {
-        case shelf, browser
-
-        var size: NSSize {
-            switch self {
-            case .shelf: NSSize(width: 460, height: 100)
-            case .browser: NSSize(width: 720, height: 538)
-            }
-        }
+    private func savedShelfSize() -> NSSize {
+        let width = UserDefaults.standard.double(forKey: "dockShelfWidth")
+        return NSSize(width: width > 0 ? width : 720, height: 100)
     }
 
-    private func resizePanel(for mode: PanelMode) {
-        let panel = makePanelIfNeeded()
-        panel.setContentSize(mode.size)
-        position(panel)
+    private func savedBrowserSize() -> NSSize {
+        let width = UserDefaults.standard.double(forKey: "dockBrowserWidth")
+        let height = UserDefaults.standard.double(forKey: "dockBrowserHeight")
+        return NSSize(width: width > 0 ? width : 720, height: height > 0 ? height : 430)
     }
 
     private func checkPointerPosition() {
@@ -618,7 +715,7 @@ final class DockController: ObservableObject {
             cancelDismissal()
         } else if inHotZone {
             show()
-        } else if let panel, panel.isVisible, !panel.frame.contains(location) {
+        } else if hasVisiblePanel && !pointerIsInsideVisiblePanel(location) {
             scheduleDismissal()
         } else {
             cancelDismissal()
@@ -629,21 +726,48 @@ final class DockController: ObservableObject {
         NSScreen.screens.first { $0.frame.contains(point) } ?? NSScreen.main
     }
 
-    private func position(_ panel: NSPanel) {
+    private var hasVisiblePanel: Bool {
+        shelfPanel?.isVisible == true || browserPanel?.isVisible == true
+    }
+
+    private func pointerIsInsideVisiblePanel(_ point: NSPoint) -> Bool {
+        (shelfPanel?.isVisible == true && shelfPanel?.frame.contains(point) == true)
+            || (browserPanel?.isVisible == true && browserPanel?.frame.contains(point) == true)
+    }
+
+    private func positionShelf(_ panel: NSPanel) {
         let mouseLocation = NSEvent.mouseLocation
         guard let screen = screen(containing: mouseLocation) else { return }
-        let frame = panel.frame
-        let x = screen.frame.midX - frame.width / 2
-        // Keep the entire rounded shelf below the menu bar. The previous positive
-        // offset pushed its top row into the menu-bar clipping region.
-        let y = screen.visibleFrame.maxY - frame.height - 4
+        let maximumWidth = max(360, screen.visibleFrame.width - 24)
+        if panel.frame.width > maximumWidth {
+            panel.setContentSize(NSSize(width: maximumWidth, height: 100))
+        }
+        let x = screen.frame.midX - panel.frame.width / 2
+        let y = screen.visibleFrame.maxY - panel.frame.height - 4
+        panel.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func positionBrowser(_ panel: NSPanel, below shelf: NSPanel) {
+        let screen = shelf.screen ?? screen(containing: NSEvent.mouseLocation) ?? NSScreen.main
+        guard let screen else { return }
+        let maximumWidth = max(520, screen.visibleFrame.width - 24)
+        let maximumHeight = max(300, shelf.frame.minY - screen.visibleFrame.minY - 12)
+        var size = panel.frame.size
+        size.width = min(max(size.width, 520), maximumWidth)
+        size.height = min(max(size.height, 300), maximumHeight)
+        if size != panel.frame.size {
+            panel.setContentSize(size)
+        }
+        let x = screen.frame.midX - panel.frame.width / 2
+        let y = shelf.frame.minY - panel.frame.height - 8
         panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
 
     private func scheduleDismissal() {
         guard dismissalWorkItem == nil else { return }
         let work = DispatchWorkItem { [weak self] in
-            self?.panel?.orderOut(nil)
+            self?.shelfPanel?.orderOut(nil)
+            self?.browserPanel?.orderOut(nil)
             self?.dismissalWorkItem = nil
         }
         dismissalWorkItem = work
@@ -710,7 +834,11 @@ final class DockController: ObservableObject {
     private func activateForInput() {
         keepOpen()
         NSApp.activate(ignoringOtherApps: true)
-        panel?.makeKeyAndOrderFront(nil)
+        if currentFolder != nil || isManagingSets {
+            browserPanel?.makeKeyAndOrderFront(nil)
+        } else {
+            shelfPanel?.makeKeyAndOrderFront(nil)
+        }
     }
 
     private func handleShortcutEvent(_ event: NSEvent) -> NSEvent? {
@@ -718,7 +846,7 @@ final class DockController: ObservableObject {
             return handleMouseShortcut(event) ? nil : event
         }
 
-        guard panel?.isKeyWindow == true else { return event }
+        guard shelfPanel?.isKeyWindow == true || browserPanel?.isKeyWindow == true else { return event }
         if event.keyCode == 53 { // Escape
             handleEscape()
             return nil
@@ -769,9 +897,7 @@ final class DockController: ObservableObject {
     }
 
     private func handleGlobalMouseShortcut(_ event: NSEvent) {
-        guard let panel,
-              panel.isVisible,
-              panel.frame.contains(NSEvent.mouseLocation) else { return }
+        guard pointerIsInsideVisiblePanel(NSEvent.mouseLocation) else { return }
         _ = handleMouseShortcut(event)
     }
 
@@ -801,8 +927,20 @@ private enum FinderTagWriteError: LocalizedError {
     }
 }
 
-private final class DockPanel: NSPanel {
+private final class DockPanel: NSPanel, NSWindowDelegate {
     var escapeAction: () -> Void = {}
+    var resizeEndedAction: () -> Void = {}
+    var fixedContentHeight: CGFloat?
+
+    override init(
+        contentRect: NSRect,
+        styleMask style: NSWindow.StyleMask,
+        backing backingStoreType: NSWindow.BackingStoreType,
+        defer flag: Bool
+    ) {
+        super.init(contentRect: contentRect, styleMask: style, backing: backingStoreType, defer: flag)
+        delegate = self
+    }
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
@@ -817,6 +955,15 @@ private final class DockPanel: NSPanel {
 
     override func cancelOperation(_ sender: Any?) {
         escapeAction()
+    }
+
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        guard let fixedContentHeight else { return frameSize }
+        return NSSize(width: frameSize.width, height: fixedContentHeight)
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        resizeEndedAction()
     }
 }
 

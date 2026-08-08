@@ -1,6 +1,16 @@
 import AppKit
+import Darwin
 import SwiftUI
 import UniformTypeIdentifiers
+
+private let compactBrowserDateFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.timeZone = .current
+    formatter.dateFormat = "dd/MM/yy HH:mm"
+    return formatter
+}()
 
 struct DockView: View {
     @ObservedObject var store: FolderStore
@@ -12,15 +22,7 @@ struct DockView: View {
     @State private var editingSetName = ""
 
     var body: some View {
-        VStack(spacing: 8) {
-            shelf
-
-            if let currentFolder = controller.currentFolder {
-                FolderBrowser(folder: currentFolder, controller: controller)
-            } else if controller.isManagingSets {
-                FolderSetManager(store: store, controller: controller)
-            }
-        }
+        shelf
     }
 
     private var shelf: some View {
@@ -71,23 +73,33 @@ struct DockView: View {
                 }
                 .frame(maxWidth: .infinity)
 
-                Button(action: controller.showSetManager) {
-                    Image(systemName: "slider.horizontal.3")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 25, height: 25)
-                }
-                .buttonStyle(.plain)
-                .help("Manage folder sets")
+                HStack(spacing: 2) {
+                    Text("B\(buildNumber)")
+                        .font(.system(size: 8, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.tertiary)
+                        .monospacedDigit()
+                        .help("Build \(buildNumber)")
 
-                Button(action: controller.hide) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 25, height: 25)
+                    Button(action: controller.showSetManager) {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 25, height: 25)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Manage folder sets")
+
+                    Button(action: controller.hide) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 25, height: 25)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Hide Folder Dock (Esc)")
                 }
-                .buttonStyle(.plain)
-                .help("Hide Folder Dock (Esc)")
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(2)
             }
             .padding(.horizontal, 12)
             .padding(.top, 6)
@@ -135,17 +147,35 @@ struct DockView: View {
             .padding(.horizontal, 12)
             .frame(height: 63)
         }
-        .frame(width: shelfWidth, height: 100)
+        .frame(minWidth: 360, maxWidth: .infinity, minHeight: 100, maxHeight: 100)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(isTargeted ? Color.accentColor.opacity(0.9) : Color.white.opacity(0.16), lineWidth: isTargeted ? 2 : 1)
         }
+        .overlay(alignment: .bottomLeading) {
+            DockResizeHandle(allowsVerticalResize: false, fromLeadingEdge: true) {
+                controller.beginShelfResize()
+            } onChange: {
+                controller.updateShelfResize(fromLeadingEdge: true)
+            } onEnd: {
+                controller.endShelfResize()
+            }
+        }
+        .overlay(alignment: .bottomTrailing) {
+            DockResizeHandle(allowsVerticalResize: false, fromLeadingEdge: false) {
+                controller.beginShelfResize()
+            } onChange: {
+                controller.updateShelfResize(fromLeadingEdge: false)
+            } onEnd: {
+                controller.endShelfResize()
+            }
+        }
         .onDrop(of: [.fileURL], isTargeted: $isTargeted, perform: acceptDrop(providers:))
     }
 
-    private var shelfWidth: CGFloat {
-        controller.currentFolder != nil || controller.isManagingSets ? 720 : 460
+    private var buildNumber: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "dev"
     }
 
     private var emptyState: some View {
@@ -176,6 +206,82 @@ struct DockView: View {
             }
         }
         return !providers.isEmpty
+    }
+}
+
+struct DockBrowserView: View {
+    @ObservedObject var store: FolderStore
+    @ObservedObject var controller: DockController
+
+    var body: some View {
+        Group {
+            if let currentFolder = controller.currentFolder {
+                FolderBrowser(folder: currentFolder, controller: controller)
+                    .id(currentFolder.standardizedFileURL.path)
+            } else if controller.isManagingSets {
+                FolderSetManager(store: store, controller: controller)
+            } else {
+                Color.clear
+            }
+        }
+        .frame(minWidth: 520, maxWidth: .infinity, minHeight: 300, maxHeight: .infinity)
+        .overlay(alignment: .bottomLeading) {
+            DockResizeHandle(allowsVerticalResize: true, fromLeadingEdge: true) {
+                controller.beginBrowserResize()
+            } onChange: {
+                controller.updateBrowserResize(fromLeadingEdge: true)
+            } onEnd: {
+                controller.endBrowserResize()
+            }
+        }
+        .overlay(alignment: .bottomTrailing) {
+            DockResizeHandle(allowsVerticalResize: true, fromLeadingEdge: false) {
+                controller.beginBrowserResize()
+            } onChange: {
+                controller.updateBrowserResize(fromLeadingEdge: false)
+            } onEnd: {
+                controller.endBrowserResize()
+            }
+        }
+    }
+}
+
+private struct DockResizeHandle: View {
+    let allowsVerticalResize: Bool
+    let fromLeadingEdge: Bool
+    let onBegin: () -> Void
+    let onChange: () -> Void
+    let onEnd: () -> Void
+    @State private var isDragging = false
+
+    var body: some View {
+        Image(systemName: allowsVerticalResize ? "arrow.up.left.and.arrow.down.right" : "arrow.left.and.right")
+            .font(.system(size: 7, weight: .semibold))
+            .foregroundStyle(.secondary.opacity(0.42))
+            .scaleEffect(x: fromLeadingEdge ? -1 : 1)
+            .frame(width: 18, height: 18)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                    .onChanged { _ in
+                        if !isDragging {
+                            isDragging = true
+                            onBegin()
+                        }
+                        onChange()
+                    }
+                    .onEnded { _ in
+                        isDragging = false
+                        onEnd()
+                    }
+            )
+            .onHover { hovering in
+                if allowsVerticalResize {
+                    hovering ? NSCursor.crosshair.set() : NSCursor.arrow.set()
+                } else {
+                    hovering ? NSCursor.resizeLeftRight.set() : NSCursor.arrow.set()
+                }
+            }
     }
 }
 
@@ -341,26 +447,22 @@ private struct FinderTag: Hashable, Sendable {
     }
 
     private static func rawFinderTags(for url: URL) -> [String] {
-        let output = Pipe()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
-        process.arguments = ["-px", "com.apple.metadata:_kMDItemUserTags", url.path]
-        process.standardOutput = output
-        guard (try? process.run()) != nil else { return [] }
-        process.waitUntilExit()
-        guard process.terminationStatus == 0,
-              let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) else { return [] }
-        let hex = text.filter(\.isHexDigit)
-        guard hex.count.isMultiple(of: 2) else { return [] }
-        var bytes = Data()
-        var index = hex.startIndex
-        while index < hex.endIndex {
-            let next = hex.index(index, offsetBy: 2)
-            guard let byte = UInt8(hex[index..<next], radix: 16) else { return [] }
-            bytes.append(byte)
-            index = next
+        let attribute = "com.apple.metadata:_kMDItemUserTags"
+        let data: Data? = url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return nil }
+            return attribute.withCString { name in
+                let byteCount = getxattr(path, name, nil, 0, 0, 0)
+                guard byteCount > 0 else { return nil }
+                var data = Data(count: byteCount)
+                let readCount = data.withUnsafeMutableBytes { bytes in
+                    getxattr(path, name, bytes.baseAddress, byteCount, 0, 0)
+                }
+                guard readCount == byteCount else { return nil }
+                return data
+            }
         }
-        return (try? PropertyListSerialization.propertyList(from: bytes, format: nil)) as? [String] ?? []
+        guard let data else { return [] }
+        return (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String] ?? []
     }
 
     private static func defaultColorIndex(for name: String) -> Int {
@@ -473,12 +575,14 @@ private struct FolderBrowser: View {
     let folder: URL
     @ObservedObject var controller: DockController
     @State private var items: [BrowserItem] = []
+    @State private var loadedFolderPath: String?
     @State private var loadError: String?
     @State private var isLoading = false
     @State private var isFileDropTarget = false
     @State private var searchText = ""
     @State private var tagRefreshTimer: Timer?
     @State private var tagRefreshTick = 0
+    @State private var loadRequestID = UUID()
     @AppStorage("browserViewMode") private var viewMode = "icons"
     @AppStorage("browserListNameColumnWidth") private var nameColumnWidth = 326.0
     @AppStorage("browserListKindColumnWidth") private var kindColumnWidth = 82.0
@@ -603,7 +707,7 @@ private struct FolderBrowser: View {
             }
 
             Group {
-                if isLoading {
+                if isLoading || loadedFolderPath != folder.standardizedFileURL.path {
                     ProgressView("Loading \(folder.lastPathComponent)…")
                         .controlSize(.small)
                 } else if let loadError {
@@ -630,7 +734,7 @@ private struct FolderBrowser: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 720, height: 430)
+        .frame(minWidth: 520, maxWidth: .infinity, minHeight: 300, maxHeight: .infinity)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
@@ -659,8 +763,17 @@ private struct FolderBrowser: View {
         .onDisappear {
             tagRefreshTimer?.invalidate()
             tagRefreshTimer = nil
+            loadRequestID = UUID()
         }
-        .onChange(of: folder.path) { _, _ in loadItems() }
+        .onChange(of: folder.path) { _, _ in
+            loadRequestID = UUID()
+            items = []
+            loadedFolderPath = nil
+            loadError = nil
+            searchText = ""
+            controller.updateCurrentDirectoryItems([])
+            loadItems()
+        }
         .onChange(of: controller.directoryRevision) { _, _ in loadItems() }
         .onChange(of: sortKeyValue) { _, _ in updateSelectionOrder() }
         .onChange(of: sortAscending) { _, _ in updateSelectionOrder() }
@@ -669,16 +782,22 @@ private struct FolderBrowser: View {
 
     private func loadItems(showLoading: Bool = true) {
         let directory = folder
-        if showLoading && items.isEmpty { isLoading = true }
+        let requestID = UUID()
+        loadRequestID = requestID
+        if showLoading && items.isEmpty {
+            isLoading = true
+            loadedFolderPath = nil
+        }
         Task {
             let result = await Task.detached(priority: .userInitiated) {
                 Self.readItems(in: directory)
             }.value
 
-            guard directory == folder else { return }
+            guard requestID == loadRequestID else { return }
             isLoading = false
             switch result {
             case let .success(loadedItems):
+                loadedFolderPath = directory.standardizedFileURL.path
                 if items.map(\.url) != loadedItems.map(\.url) {
                     items = loadedItems
                 }
@@ -686,6 +805,7 @@ private struct FolderBrowser: View {
                 loadError = nil
             case let .failure(.message(message)):
                 items = []
+                loadedFolderPath = nil
                 controller.updateCurrentDirectoryItems([])
                 loadError = message
             }
@@ -1114,7 +1234,7 @@ private struct BrowserListRow: View {
     }
     private var modified: String {
         guard let date = item.modificationDate else { return "—" }
-        return date.formatted(.dateTime.month(.abbreviated).day().hour().minute())
+        return compactBrowserDateFormatter.string(from: date)
     }
 
     var body: some View {

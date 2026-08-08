@@ -104,7 +104,7 @@ struct FolderSetManager: View {
             }
             .padding(14)
         }
-        .frame(width: 720, height: 430)
+        .frame(minWidth: 520, maxWidth: .infinity, minHeight: 300, maxHeight: .infinity)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
