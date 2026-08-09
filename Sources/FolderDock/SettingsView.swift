@@ -36,22 +36,37 @@ struct SettingsView: View {
             }
 
             Section("Updates") {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Folder Dock \(versionText)")
-                        Text(updateStatusText)
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Folder Dock \(versionText)")
+                            Text(updateStatusText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button(updateController.isUpdateAvailable ? "Update" : "Check Now") {
+                            if updateController.isUpdateAvailable {
+                                updateController.checkForUpdates()
+                            } else {
+                                updateController.probeForUpdate()
+                            }
+                        }
+                        .disabled(updateController.isChecking)
+                    }
+
+                    HStack(alignment: .firstTextBaseline) {
+                        Image(systemName: "lock.shield")
+                            .foregroundStyle(.secondary)
+                        Text("Automatic installation requires App Management permission.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button(updateController.isUpdateAvailable ? "Update" : "Check Now") {
-                        if updateController.isUpdateAvailable {
-                            updateController.checkForUpdates()
-                        } else {
-                            updateController.probeForUpdate()
+                        Spacer()
+                        Button("Open App Management") {
+                            updateController.openAppManagementSettings()
                         }
+                        .controlSize(.small)
                     }
-                    .disabled(updateController.isChecking)
                 }
             }
         }

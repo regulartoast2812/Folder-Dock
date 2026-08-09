@@ -11,6 +11,15 @@ A compact macOS folder launcher that appears when you move the pointer to the to
 
 Saved folders are stored locally in the app's User Defaults. Click a folder to open it; right-click to reveal or remove it.
 
+## Team installation
+
+1. Download the latest `Folder-Dock-*.zip` from [GitHub Releases](https://github.com/regulartoast2812/Folder-Dock/releases/latest).
+2. Unzip it and move **Folder Dock.app** to Applications.
+3. On first launch, right-click **Folder Dock.app** and choose **Open** if macOS shows an unidentified-developer warning.
+4. Enable **Folder Dock** in **System Settings → Privacy & Security → App Management**. This one-time permission lets Sparkle replace the installed app when a signed update is ready.
+
+Folder Dock also shows this App Management reminder once inside the app. The same shortcut remains available under **Settings → Updates**.
+
 ## Publishing updates
 
 Folder Dock uses Sparkle 2 and GitHub Releases. The app performs a silent update probe and only shows an **Update** button beside its build number when a newer signed build is available. Clicking it opens Sparkle's download and install flow.
