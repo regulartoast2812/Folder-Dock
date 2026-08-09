@@ -1,6 +1,7 @@
 # SwiftPM build products and locally packaged app bundles
 .build/
 dist/
+release/
 
 # Finder and Xcode user-specific files
 .DS_Store

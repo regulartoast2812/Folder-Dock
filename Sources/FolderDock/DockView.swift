@@ -15,6 +15,7 @@ private let compactBrowserDateFormatter: DateFormatter = {
 struct DockView: View {
     @ObservedObject var store: FolderStore
     @ObservedObject var controller: DockController
+    @ObservedObject var updateController: UpdateController
     @State private var isTargeted = false
     @State private var draggedSetID: UUID?
     @State private var draggedFolderID: UUID?
@@ -79,6 +80,15 @@ struct DockView: View {
                         .foregroundStyle(.tertiary)
                         .monospacedDigit()
                         .help("Build \(buildNumber)")
+
+                    if updateController.isUpdateAvailable {
+                        Button("Update") {
+                            updateController.checkForUpdates()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.mini)
+                        .help(updateHelpText)
+                    }
 
                     Button(action: controller.showSetManager) {
                         Image(systemName: "slider.horizontal.3")
@@ -176,6 +186,13 @@ struct DockView: View {
 
     private var buildNumber: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "dev"
+    }
+
+    private var updateHelpText: String {
+        if let version = updateController.availableVersion {
+            return "Install Folder Dock \(version)"
+        }
+        return "Install update"
     }
 
     private var emptyState: some View {

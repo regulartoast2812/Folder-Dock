@@ -11,6 +11,17 @@ A compact macOS folder launcher that appears when you move the pointer to the to
 
 Saved folders are stored locally in the app's User Defaults. Click a folder to open it; right-click to reveal or remove it.
 
+## Publishing updates
+
+Folder Dock uses Sparkle 2 and GitHub Releases. The app performs a silent update probe and only shows an **Update** button beside its build number when a newer signed build is available. Clicking it opens Sparkle's download and install flow.
+
+1. Increase `CFBundleShortVersionString` and/or `CFBundleVersion` in `Resources/Info.plist`.
+2. Run `./scripts/prepare-release.sh`.
+3. Create a GitHub Release using the tag printed by the script.
+4. Upload both generated files from `release/`: the Folder Dock ZIP and `appcast.xml`.
+
+The Sparkle private Ed25519 key is stored in the macOS Keychain under the `ed25519` account and is never committed. Keep a secure backup of that key. The app contains only its public key.
+
 ## Finder-style browser shortcuts
 
 When browsing a saved folder, click once to select an item and double-click to open it.

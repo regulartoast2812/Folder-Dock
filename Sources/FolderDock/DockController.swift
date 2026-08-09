@@ -22,6 +22,7 @@ enum DockPrompt: Identifiable {
 @MainActor
 final class DockController: ObservableObject {
     private let store: FolderStore
+    let updateController: UpdateController
     private var shelfPanel: DockPanel?
     private var browserPanel: DockPanel?
     private var hoverTimer: Timer?
@@ -52,8 +53,9 @@ final class DockController: ObservableObject {
     var selectedItemURL: URL? { selectionAnchorURL ?? selectedItemURLs.first }
     var selectedItemCount: Int { selectedItemURLs.count }
 
-    init(store: FolderStore) {
+    init(store: FolderStore, updateController: UpdateController) {
         self.store = store
+        self.updateController = updateController
     }
 
     func start() {
@@ -650,7 +652,11 @@ final class DockController: ObservableObject {
                 self.positionBrowser(browser, below: panel)
             }
         }
-        panel.contentView = NSHostingView(rootView: DockView(store: store, controller: self))
+        panel.contentView = NSHostingView(rootView: DockView(
+            store: store,
+            controller: self,
+            updateController: updateController
+        ))
         shelfPanel = panel
         return panel
     }

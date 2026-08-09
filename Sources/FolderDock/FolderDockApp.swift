@@ -6,23 +6,31 @@ struct FolderDockApp: App {
     @NSApplicationDelegateAdaptor(FolderDockAppDelegate.self) private var appDelegate
     @StateObject private var store: FolderStore
     @StateObject private var dockController: DockController
+    @StateObject private var updateController: UpdateController
 
     init() {
         let store = FolderStore()
-        let dockController = DockController(store: store)
+        let updateController = UpdateController()
+        let dockController = DockController(store: store, updateController: updateController)
         _store = StateObject(wrappedValue: store)
         _dockController = StateObject(wrappedValue: dockController)
+        _updateController = StateObject(wrappedValue: updateController)
         appDelegate.dockController = dockController
+        appDelegate.updateController = updateController
     }
 
     var body: some Scene {
         MenuBarExtra("Folder Dock", systemImage: "folder.badge.gearshape") {
-            FolderDockMenu(store: store, dockController: dockController)
+            FolderDockMenu(
+                store: store,
+                dockController: dockController,
+                updateController: updateController
+            )
         }
         .menuBarExtraStyle(.window)
 
         Settings {
-            SettingsView(store: store)
+            SettingsView(store: store, updateController: updateController)
         }
     }
 }
@@ -30,9 +38,11 @@ struct FolderDockApp: App {
 @MainActor
 private final class FolderDockAppDelegate: NSObject, NSApplicationDelegate {
     var dockController: DockController?
+    var updateController: UpdateController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         dockController?.start()
+        updateController?.start()
     }
 
     func applicationDidResignActive(_ notification: Notification) {
@@ -43,6 +53,7 @@ private final class FolderDockAppDelegate: NSObject, NSApplicationDelegate {
 private struct FolderDockMenu: View {
     @ObservedObject var store: FolderStore
     @ObservedObject var dockController: DockController
+    @ObservedObject var updateController: UpdateController
 
     var body: some View {
         if store.folders.isEmpty {
@@ -69,6 +80,10 @@ private struct FolderDockMenu: View {
 
         SettingsLink {
             Text("Settings…")
+        }
+
+        Button("Check for Updates…") {
+            updateController.checkForUpdates()
         }
 
         Button("Quit Folder Dock") {

@@ -8,9 +8,13 @@
     <key>CFBundleName</key><string>Folder Dock</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
-    <key>CFBundleVersion</key><string>4</string>
+    <key>CFBundleVersion</key><string>5</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
     <key>NSAppleEventsUsageDescription</key><string>Folder Dock uses Finder only when you middle-click a saved folder to open it in its own Finder window.</string>
+    <key>SUFeedURL</key><string>https://github.com/regulartoast2812/Folder-Dock/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key><string>SXdxubWf/obWNUSqvU0Mz0TnBMes4zb5HWpqzCJA0Ss=</string>
+    <key>SUEnableAutomaticChecks</key><false/>
+    <key>SUAllowsAutomaticUpdates</key><true/>
 </dict>
 </plist>

@@ -7,7 +7,15 @@ let package = Package(
     products: [
         .executable(name: "FolderDock", targets: ["FolderDock"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.2")
+    ],
     targets: [
-        .executableTarget(name: "FolderDock")
+        .executableTarget(
+            name: "FolderDock",
+            dependencies: [
+                .product(name: "Sparkle", package: "Sparkle")
+            ]
+        )
     ]
 )
