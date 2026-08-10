@@ -6,6 +6,7 @@ import SwiftUI
 enum DockPrompt: Identifiable {
     case newFolder(parent: URL)
     case rename(URL)
+    case batchRename([URL])
     case info(URL)
     case error(String)
 
@@ -13,10 +14,40 @@ enum DockPrompt: Identifiable {
         switch self {
         case let .newFolder(parent): "new-folder-\(parent.path)"
         case let .rename(url): "rename-\(url.path)"
+        case let .batchRename(urls): "batch-rename-\(urls.map(\.path).joined(separator: "|"))"
         case let .info(url): "info-\(url.path)"
         case let .error(message): "error-\(message)"
         }
     }
+}
+
+enum BatchRenameMode: String, CaseIterable, Identifiable {
+    case replaceText = "Replace Text"
+    case addText = "Add Text"
+    case format = "Format"
+
+    var id: String { rawValue }
+}
+
+enum BatchRenamePosition: String, CaseIterable, Identifiable {
+    case afterName = "after name"
+    case beforeName = "before name"
+
+    var id: String { rawValue }
+}
+
+enum BatchRenameFormat: String, CaseIterable, Identifiable {
+    case nameAndIndex = "Name and Index"
+    case nameAndCounter = "Name and Counter"
+    case nameAndDate = "Name and Date"
+
+    var id: String { rawValue }
+}
+
+private struct BatchRenamePlan {
+    let source: URL
+    let temporary: URL
+    let destination: URL
 }
 
 @MainActor
@@ -47,6 +78,16 @@ final class DockController: ObservableObject {
     @Published private(set) var directoryRevision = UUID()
     @Published private(set) var prompt: DockPrompt?
     @Published var promptText = ""
+    @Published var batchRenameMode: BatchRenameMode = .replaceText
+    @Published var batchRenamePosition: BatchRenamePosition = .afterName
+    @Published var batchRenameFormat: BatchRenameFormat = .nameAndIndex
+    @Published var batchRenameFindText = ""
+    @Published var batchRenameReplacementText = ""
+    @Published var batchRenameAddedText = ""
+    @Published var batchRenameFormatName = "File"
+    @Published var batchRenameStartIndex = 1
+    @Published private(set) var batchRenameError: String?
+    private var batchRenameReferenceDate = Date()
 
     var canGoBack: Bool { historyIndex > 0 }
     var canGoForward: Bool { historyIndex >= 0 && historyIndex < navigationHistory.count - 1 }
@@ -285,6 +326,55 @@ final class DockController: ObservableObject {
 
     func openSelectedItem() {
         openItems(Array(selectedItemURLs))
+    }
+
+    func renameSelectedItem() {
+        renameItems(Array(selectedItemURLs))
+    }
+
+    func renameItems(_ urls: [URL]) {
+        let requested = Set(urls.map(\.standardizedFileURL))
+        var urls = currentDirectoryItemURLs.filter { requested.contains($0.standardizedFileURL) }
+        let ordered = Set(urls.map(\.standardizedFileURL))
+        urls.append(contentsOf: requested.subtracting(ordered).sorted {
+            $0.path.localizedStandardCompare($1.path) == .orderedAscending
+        })
+        guard !urls.isEmpty else { return }
+        if urls.count == 1, let url = urls.first {
+            rename(url)
+            return
+        }
+
+        batchRenameError = nil
+        batchRenameFindText = ""
+        batchRenameReplacementText = ""
+        batchRenameAddedText = ""
+        batchRenameFormatName = "File"
+        batchRenameStartIndex = 1
+        batchRenameReferenceDate = Date()
+        prompt = .batchRename(urls)
+        activateForInput()
+    }
+
+    var canConfirmBatchRename: Bool {
+        switch batchRenameMode {
+        case .replaceText:
+            !batchRenameFindText.isEmpty
+        case .addText:
+            !batchRenameAddedText.isEmpty
+        case .format:
+            !batchRenameFormatName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    var batchRenameExample: String {
+        guard case let .batchRename(urls) = prompt,
+              let first = urls.first else { return "" }
+        return batchRenamedFilename(for: first, offset: 0)
+    }
+
+    func clearBatchRenameError() {
+        batchRenameError = nil
     }
 
     func openItems(_ urls: [URL]) {
@@ -554,6 +644,7 @@ final class DockController: ObservableObject {
     func cancelPrompt() {
         prompt = nil
         promptText = ""
+        batchRenameError = nil
     }
 
     func confirmPrompt() {
@@ -563,6 +654,8 @@ final class DockController: ObservableObject {
             createFolder(named: promptText, in: parent)
         case let .rename(source):
             rename(source, to: promptText)
+        case let .batchRename(urls):
+            applyBatchRename(to: urls)
         case .info, .error:
             cancelPrompt()
         }
@@ -601,6 +694,146 @@ final class DockController: ObservableObject {
         } catch {
             prompt = .error(error.localizedDescription)
         }
+    }
+
+    private func applyBatchRename(to urls: [URL]) {
+        guard urls.count > 1, canConfirmBatchRename else { return }
+        batchRenameError = nil
+
+        let sources = urls.map(\.standardizedFileURL)
+        let sourcePathKeys = Set(sources.map { normalizedFilenameKey($0.path) })
+        var destinationNameKeys = Set<String>()
+        var plans: [BatchRenamePlan] = []
+        var destinations: [URL] = []
+
+        for (offset, source) in sources.enumerated() {
+            let newName = batchRenamedFilename(for: source, offset: offset)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !newName.isEmpty,
+                  newName != ".",
+                  newName != "..",
+                  !newName.hasPrefix("."),
+                  !newName.contains("/"),
+                  !newName.contains(":") else {
+                batchRenameError = "Names can’t begin with a period or contain a slash or colon."
+                return
+            }
+
+            let isDirectory = (try? source.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            let destination = source.deletingLastPathComponent()
+                .appendingPathComponent(newName, isDirectory: isDirectory)
+                .standardizedFileURL
+            let destinationNameKey = normalizedFilenameKey(destination.path)
+            guard destinationNameKeys.insert(destinationNameKey).inserted else {
+                batchRenameError = "These settings would give two items the same name."
+                return
+            }
+            if FileManager.default.fileExists(atPath: destination.path),
+               !sourcePathKeys.contains(destinationNameKey) {
+                batchRenameError = "An item named \(newName) already exists."
+                return
+            }
+
+            destinations.append(destination)
+            guard destination.path != source.path else { continue }
+            let temporary = source.deletingLastPathComponent()
+                .appendingPathComponent(".folder-dock-rename-\(UUID().uuidString)", isDirectory: isDirectory)
+            plans.append(BatchRenamePlan(source: source, temporary: temporary, destination: destination))
+        }
+
+        guard !plans.isEmpty else {
+            cancelPrompt()
+            return
+        }
+
+        var staged: [BatchRenamePlan] = []
+        do {
+            for plan in plans {
+                try FileManager.default.moveItem(at: plan.source, to: plan.temporary)
+                staged.append(plan)
+            }
+        } catch {
+            for plan in staged.reversed() {
+                try? FileManager.default.moveItem(at: plan.temporary, to: plan.source)
+            }
+            batchRenameError = error.localizedDescription
+            return
+        }
+
+        var completed: [BatchRenamePlan] = []
+        do {
+            for plan in plans {
+                try FileManager.default.moveItem(at: plan.temporary, to: plan.destination)
+                completed.append(plan)
+            }
+        } catch {
+            for plan in completed.reversed() {
+                try? FileManager.default.moveItem(at: plan.destination, to: plan.temporary)
+            }
+            for plan in plans.reversed() where FileManager.default.fileExists(atPath: plan.temporary.path) {
+                try? FileManager.default.moveItem(at: plan.temporary, to: plan.source)
+            }
+            batchRenameError = error.localizedDescription
+            return
+        }
+
+        selectedItemURLs = Set(destinations)
+        selectionAnchorURL = destinations.first
+        cancelPrompt()
+        refreshFolder()
+    }
+
+    private func batchRenamedFilename(for url: URL, offset: Int) -> String {
+        let components = batchRenameNameComponents(for: url)
+        let renamedBase: String
+
+        switch batchRenameMode {
+        case .replaceText:
+            renamedBase = components.base.replacingOccurrences(
+                of: batchRenameFindText,
+                with: batchRenameReplacementText
+            )
+        case .addText:
+            switch batchRenamePosition {
+            case .afterName: renamedBase = components.base + batchRenameAddedText
+            case .beforeName: renamedBase = batchRenameAddedText + components.base
+            }
+        case .format:
+            let customName = batchRenameFormatName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let suffix: String
+            switch batchRenameFormat {
+            case .nameAndIndex:
+                suffix = String(max(0, batchRenameStartIndex) + offset)
+            case .nameAndCounter:
+                suffix = String(format: "%05d", max(0, batchRenameStartIndex) + offset)
+            case .nameAndDate:
+                let formatter = DateFormatter()
+                formatter.locale = Locale(identifier: "en_US_POSIX")
+                formatter.dateFormat = "dd-MM-yyyy 'at' HH.mm.ss"
+                let itemDate = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                    ?? batchRenameReferenceDate
+                suffix = formatter.string(from: itemDate)
+            }
+            switch batchRenamePosition {
+            case .afterName: renamedBase = "\(customName) \(suffix)"
+            case .beforeName: renamedBase = "\(suffix) \(customName)"
+            }
+        }
+
+        return renamedBase + components.extensionSuffix
+    }
+
+    private func batchRenameNameComponents(for url: URL) -> (base: String, extensionSuffix: String) {
+        let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+        let pathExtension = url.pathExtension
+        guard !isDirectory, !pathExtension.isEmpty else {
+            return (url.lastPathComponent, "")
+        }
+        return (url.deletingPathExtension().lastPathComponent, ".\(pathExtension)")
+    }
+
+    private func normalizedFilenameKey(_ value: String) -> String {
+        value.precomposedStringWithCanonicalMapping.lowercased()
     }
 
     func receiveFileDrop(_ providers: [NSItemProvider], into destination: URL) -> Bool {
@@ -915,7 +1148,7 @@ final class DockController: ObservableObject {
         if !command && event.keyCode == 115 { moveSelection(by: -Int.max, extending: shift); return nil } // Home
         if !command && event.keyCode == 119 { moveSelection(by: Int.max, extending: shift); return nil } // End
         if event.keyCode == 49 { showQuickLook(); return nil } // Space
-        if event.keyCode == 36 || event.keyCode == 76 { openSelectedItem(); return nil } // Return / keypad Enter
+        if event.keyCode == 36 || event.keyCode == 76 { renameSelectedItem(); return nil } // Return / keypad Enter
 
         return event
     }

@@ -730,6 +730,11 @@ private struct FolderBrowser: View {
 
             Divider()
 
+            if isBatchRenaming {
+                BatchRenameBar(controller: controller)
+                Divider()
+            }
+
             if let bannerPrompt {
                 BrowserNotice(prompt: bannerPrompt, controller: controller)
                 Divider()
@@ -1030,8 +1035,12 @@ private struct FolderBrowser: View {
     private var bannerPrompt: DockPrompt? {
         switch controller.prompt {
         case .info, .error: controller.prompt
-        case .newFolder, .rename, .none: nil
+        case .newFolder, .rename, .batchRename, .none: nil
         }
+    }
+    private var isBatchRenaming: Bool {
+        if case .batchRename = controller.prompt { return true }
+        return false
     }
 
     private func changeSort(_ key: BrowserSortKey) {
@@ -1097,6 +1106,148 @@ private struct ColumnResizeHandle: View {
     }
 }
 
+private enum BatchRenameFocusedField: Hashable {
+    case find
+    case replacement
+    case addedText
+    case formatName
+    case startIndex
+}
+
+private struct BatchRenameBar: View {
+    @ObservedObject var controller: DockController
+    @FocusState private var focusedField: BatchRenameFocusedField?
+
+    private var itemCount: Int {
+        if case let .batchRename(urls) = controller.prompt { return urls.count }
+        return 0
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Text("Rename \(itemCount) Finder Items:")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Button(action: controller.cancelPrompt) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .help("Cancel batch rename (Esc)")
+            }
+
+            HStack(spacing: 8) {
+                Picker("Rename mode", selection: $controller.batchRenameMode) {
+                    ForEach(BatchRenameMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 132)
+
+                batchControls
+            }
+
+            HStack(spacing: 8) {
+                if let error = controller.batchRenameError {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(error)
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                } else {
+                    Text("Example:")
+                        .foregroundStyle(.secondary)
+                    Text(controller.batchRenameExample)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer(minLength: 8)
+                Button("Cancel", action: controller.cancelPrompt)
+                    .keyboardShortcut(.cancelAction)
+                Button("Rename", action: controller.confirmPrompt)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!controller.canConfirmBatchRename)
+            }
+            .font(.system(size: 11))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.accentColor.opacity(0.07))
+        .onAppear { focusPrimaryField() }
+        .onChange(of: controller.batchRenameMode) { _, _ in
+            controller.clearBatchRenameError()
+            focusPrimaryField()
+        }
+        .onChange(of: controller.batchRenameFindText) { _, _ in controller.clearBatchRenameError() }
+        .onChange(of: controller.batchRenameReplacementText) { _, _ in controller.clearBatchRenameError() }
+        .onChange(of: controller.batchRenameAddedText) { _, _ in controller.clearBatchRenameError() }
+        .onChange(of: controller.batchRenameFormatName) { _, _ in controller.clearBatchRenameError() }
+        .onChange(of: controller.batchRenameFormat) { _, _ in controller.clearBatchRenameError() }
+        .onChange(of: controller.batchRenamePosition) { _, _ in controller.clearBatchRenameError() }
+        .onChange(of: controller.batchRenameStartIndex) { _, _ in controller.clearBatchRenameError() }
+    }
+
+    @ViewBuilder
+    private var batchControls: some View {
+        switch controller.batchRenameMode {
+        case .replaceText:
+            TextField("Find", text: $controller.batchRenameFindText)
+                .focused($focusedField, equals: .find)
+            TextField("Replace with", text: $controller.batchRenameReplacementText)
+                .focused($focusedField, equals: .replacement)
+
+        case .addText:
+            TextField("Text to add", text: $controller.batchRenameAddedText)
+                .focused($focusedField, equals: .addedText)
+            Picker("Position", selection: $controller.batchRenamePosition) {
+                ForEach(BatchRenamePosition.allCases) { position in
+                    Text(position.rawValue).tag(position)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 112)
+
+        case .format:
+            TextField("Custom Format", text: $controller.batchRenameFormatName)
+                .focused($focusedField, equals: .formatName)
+                .frame(minWidth: 92)
+            Picker("Format", selection: $controller.batchRenameFormat) {
+                ForEach(BatchRenameFormat.allCases) { format in
+                    Text(format.rawValue).tag(format)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 132)
+            Picker("Position", selection: $controller.batchRenamePosition) {
+                ForEach(BatchRenamePosition.allCases) { position in
+                    Text(position.rawValue).tag(position)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 112)
+            if controller.batchRenameFormat != .nameAndDate {
+                TextField("Start", value: $controller.batchRenameStartIndex, format: .number)
+                    .focused($focusedField, equals: .startIndex)
+                    .frame(width: 54)
+                    .help("Start numbers at")
+            }
+        }
+    }
+
+    private func focusPrimaryField() {
+        DispatchQueue.main.async {
+            switch controller.batchRenameMode {
+            case .replaceText: focusedField = .find
+            case .addText: focusedField = .addedText
+            case .format: focusedField = .formatName
+            }
+        }
+    }
+}
+
 private struct BrowserNotice: View {
     let prompt: DockPrompt
     @ObservedObject var controller: DockController
@@ -1115,7 +1266,7 @@ private struct BrowserNotice: View {
             let date = values?.contentModificationDate.map { " · Modified \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
             return "\(url.lastPathComponent) · \(kind) · \(size)\(date)\n\(url.path)"
         case let .error(message): return message
-        case .newFolder, .rename: return ""
+        case .newFolder, .rename, .batchRename: return ""
         }
     }
 
@@ -1451,8 +1602,9 @@ private struct FileItemContextMenu: View {
             controller.quickLook(targets)
         }
         Divider()
-        Button("Rename…") { controller.rename(item.url) }
-            .disabled(targetCount != 1)
+        Button(targetCount == 1 ? "Rename…" : "Rename \(targetCount) Items…") {
+            controller.renameItems(targets)
+        }
         Button("Duplicate\(actionSuffix)") { controller.duplicate(targets) }
         Button("Copy\(actionSuffix)") { controller.copyToPasteboard(targets) }
         Button("Cut\(actionSuffix)") { controller.cutItems(targets) }

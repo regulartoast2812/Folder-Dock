@@ -41,7 +41,8 @@ Drag files or folders from Finder onto the open browser to move them into that f
 
 - `⌘[` / `⌘]` or Logitech MX side buttons: back / forward
 - `⌘↑`: enclosing folder
-- `Return` or `⌘O`: open the selected item
+- `Return`: rename one selected item inline, or open Finder-style batch rename for multiple items
+- `⌘O`: open the selected item or items
 - `Space`: Quick Look the selected item
 - `⇧⌘N`: new folder
 - `⌘R`: refresh
