@@ -2,23 +2,33 @@
 
 A compact macOS folder launcher that appears when you move the pointer to the top-center edge of the screen.
 
-## Use
+## Quick start
 
-1. Run `./scripts/build-app.sh`.
-2. Open `dist/Folder Dock.app`.
-3. Add folders with the **+** button or drag folders into the dock.
-4. Hover anywhere in the top-center 24 pixels of a display to reveal it.
+1. Move the pointer to the top-center edge of a display to reveal Folder Dock.
+2. Add folders with the **+** button or drag folders onto the dock.
+3. Click a saved folder to browse it inside Folder Dock. Middle-click to open it in a separate Finder window.
 
-Saved folders are stored locally in the app's User Defaults. Click a folder to open it; right-click to reveal or remove it.
+Folder sets, saved folders, and preferences stay local in macOS User Defaults and are not included in the repository or release files.
 
-## Team installation
+## Install from GitHub
+
+Folder Dock requires macOS 14 or newer.
 
 1. Download the latest `Folder-Dock-*.zip` from [GitHub Releases](https://github.com/regulartoast2812/Folder-Dock/releases/latest).
-2. Unzip it and move **Folder Dock.app** to Applications.
-3. On first launch, right-click **Folder Dock.app** and choose **Open** if macOS shows an unidentified-developer warning.
-4. Enable **Folder Dock** in **System Settings → Privacy & Security → App Management**. This one-time permission lets Sparkle replace the installed app when a signed update is ready.
+2. Unzip it and move **Folder Dock.app** into **Applications**.
+3. Open the app. If macOS blocks the first launch, right-click the app, choose **Open**, then confirm **Open**. You can also use **System Settings → Privacy & Security → Open Anyway**.
+4. Move the pointer to the top-center edge of the screen to begin.
 
-The App Management shortcut remains available under **Settings → Updates** if a teammate needs to enable or review it later. Folder Dock does not interrupt launch with a permission reminder.
+App Management permission is optional and is only needed for installing in-app updates. It can be enabled later from **Folder Dock → Settings → Updates → Open App Management**. Folder Dock does not show a permission reminder at launch.
+
+## Build from source
+
+Install Xcode Command Line Tools, then run:
+
+```sh
+./scripts/build-app.sh
+open "dist/Folder Dock.app"
+```
 
 ## Publishing updates
 
