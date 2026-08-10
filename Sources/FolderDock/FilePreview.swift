@@ -7,10 +7,14 @@ struct FilePreview: View {
     let size: CGFloat
     @StateObject private var loader: ThumbnailLoader
 
-    init(url: URL, size: CGFloat) {
+    init(url: URL, size: CGFloat, modificationDate: Date? = nil) {
         self.url = url
         self.size = size
-        _loader = StateObject(wrappedValue: ThumbnailLoader(url: url, size: size))
+        _loader = StateObject(wrappedValue: ThumbnailLoader(
+            url: url,
+            size: size,
+            modificationDate: modificationDate
+        ))
     }
 
     var body: some View {
@@ -32,8 +36,8 @@ struct FilePreview: View {
 final class ThumbnailLoader: ObservableObject {
     @Published private(set) var image: NSImage?
 
-    init(url: URL, size: CGFloat) {
-        let key = ThumbnailCache.key(for: url, size: size)
+    init(url: URL, size: CGFloat, modificationDate: Date?) {
+        let key = ThumbnailCache.key(for: url, size: size, modificationDate: modificationDate)
         if let cachedImage = ThumbnailCache.images.object(forKey: key as NSString) {
             image = cachedImage
             return
@@ -67,9 +71,8 @@ private enum ThumbnailCache {
         return cache
     }()
 
-    static func key(for url: URL, size: CGFloat) -> String {
-        let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?
-            .timeIntervalSinceReferenceDate ?? 0
+    static func key(for url: URL, size: CGFloat, modificationDate: Date?) -> String {
+        let modified = modificationDate?.timeIntervalSinceReferenceDate ?? 0
         return "\(url.path)|\(modified)|\(size)"
     }
 }

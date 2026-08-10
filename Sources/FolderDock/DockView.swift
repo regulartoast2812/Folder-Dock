@@ -409,16 +409,16 @@ private struct FolderTile: View {
     }
 }
 
-private struct BrowserItem: Identifiable, Sendable {
+private struct BrowserItem: Identifiable, Sendable, Equatable {
     let url: URL
     let isDirectory: Bool
+    let kind: String
+    let size: Int
+    let modificationDate: Date?
+    let tags: [FinderTag]
 
     var id: URL { url }
     var name: String { url.lastPathComponent }
-    var kind: String { isDirectory ? "Folder" : (url.pathExtension.isEmpty ? "Document" : url.pathExtension.uppercased()) }
-    var size: Int { (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0 }
-    var modificationDate: Date? { try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }
-    var tags: [FinderTag] { FinderTag.tags(for: url) }
 }
 
 private struct FinderTag: Hashable, Sendable {
@@ -427,17 +427,23 @@ private struct FinderTag: Hashable, Sendable {
     private static let cacheLock = NSLock()
     nonisolated(unsafe) private static var cache: [String: (Date, [FinderTag])] = [:]
 
-    static func tags(for url: URL) -> [FinderTag] {
+    static func tags(
+        for url: URL,
+        knownTagNames: [String]? = nil,
+        maximumCacheAge: TimeInterval = 1.5
+    ) -> [FinderTag] {
         let cacheKey = url.path
         let now = Date()
         cacheLock.lock()
-        if let cached = cache[cacheKey], now.timeIntervalSince(cached.0) < 1.5 {
+        if maximumCacheAge > 0,
+           let cached = cache[cacheKey],
+           now.timeIntervalSince(cached.0) < maximumCacheAge {
             cacheLock.unlock()
             return cached.1
         }
         cacheLock.unlock()
 
-        let tagNames = (try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames) ?? []
+        let tagNames = knownTagNames ?? (try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames) ?? []
         guard !tagNames.isEmpty else {
             cacheLock.lock()
             cache[cacheKey] = (now, [])
@@ -596,10 +602,13 @@ private struct FolderBrowser: View {
     @State private var loadError: String?
     @State private var isLoading = false
     @State private var isFileDropTarget = false
+    @State private var browserDropFocus = false
+    @State private var activeDropTargetIDs: Set<String> = []
+    @State private var dropFocusGeneration = UUID()
     @State private var searchText = ""
-    @State private var tagRefreshTimer: Timer?
-    @State private var tagRefreshTick = 0
+    @State private var directoryRefreshTimer: Timer?
     @State private var loadRequestID = UUID()
+    @State private var loadInFlightPath: String?
     @AppStorage("browserViewMode") private var viewMode = "icons"
     @AppStorage("browserListNameColumnWidth") private var nameColumnWidth = 326.0
     @AppStorage("browserListKindColumnWidth") private var kindColumnWidth = 82.0
@@ -612,6 +621,9 @@ private struct FolderBrowser: View {
     private let columns = [GridItem(.adaptive(minimum: 86, maximum: 104), spacing: 12)]
 
     var body: some View {
+        let displayedItems = visibleItems
+        let displayedURLs = displayedItems.map(\.url)
+
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 Button(action: controller.goBack) {
@@ -733,15 +745,22 @@ private struct FolderBrowser: View {
                     ContentUnavailableView("This folder is empty", systemImage: "folder")
                 } else {
                     if viewMode == "list" {
-                        listView
+                        listView(items: displayedItems, orderedURLs: displayedURLs)
                     } else {
                         ScrollView {
                             LazyVGrid(columns: columns, spacing: 14) {
                                 if isCreatingFolder {
                                     BrowserNewFolderTile(controller: controller)
                                 }
-                                ForEach(visibleItems) { item in
-                                    BrowserItemTile(item: item, orderedURLs: visibleItems.map(\.url), refreshTick: tagRefreshTick, controller: controller)
+                                ForEach(displayedItems) { item in
+                                    BrowserItemTile(
+                                        item: item,
+                                        orderedURLs: displayedURLs,
+                                        controller: controller,
+                                        onDropFocusChanged: {
+                                            updateDropFocus(for: item.url.path, isTargeted: $0)
+                                        }
+                                    )
                                 }
                             }
                             .padding(16)
@@ -758,7 +777,7 @@ private struct FolderBrowser: View {
                 .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
         }
         .overlay {
-            if isFileDropTarget {
+            if browserDropFocus {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .strokeBorder(Color.accentColor, lineWidth: 3)
                     .padding(2)
@@ -767,20 +786,25 @@ private struct FolderBrowser: View {
         .onDrop(of: [.fileURL], isTargeted: $isFileDropTarget) { providers in
             controller.receiveFileDrop(providers, into: folder)
         }
+        .onChange(of: isFileDropTarget) { _, targeted in
+            updateDropFocus(for: "browser-root", isTargeted: targeted)
+        }
         .onAppear {
             migrateColumnLayoutIfNeeded()
             loadItems()
-            tagRefreshTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
-                Task { @MainActor in
-                    tagRefreshTick &+= 1
+            directoryRefreshTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+                MainActor.assumeIsolated {
                     loadItems(showLoading: false)
                 }
             }
         }
         .onDisappear {
-            tagRefreshTimer?.invalidate()
-            tagRefreshTimer = nil
+            directoryRefreshTimer?.invalidate()
+            directoryRefreshTimer = nil
             loadRequestID = UUID()
+            loadInFlightPath = nil
+            activeDropTargetIDs.removeAll()
+            browserDropFocus = false
         }
         .onChange(of: folder.path) { _, _ in
             loadRequestID = UUID()
@@ -799,8 +823,13 @@ private struct FolderBrowser: View {
 
     private func loadItems(showLoading: Bool = true) {
         let directory = folder
+        let directoryPath = directory.standardizedFileURL.path
+        if !showLoading, loadInFlightPath == directoryPath {
+            return
+        }
         let requestID = UUID()
         loadRequestID = requestID
+        loadInFlightPath = directoryPath
         if showLoading && items.isEmpty {
             isLoading = true
             loadedFolderPath = nil
@@ -811,14 +840,15 @@ private struct FolderBrowser: View {
             }.value
 
             guard requestID == loadRequestID else { return }
+            loadInFlightPath = nil
             isLoading = false
             switch result {
             case let .success(loadedItems):
-                loadedFolderPath = directory.standardizedFileURL.path
-                if items.map(\.url) != loadedItems.map(\.url) {
+                loadedFolderPath = directoryPath
+                if items != loadedItems {
                     items = loadedItems
+                    updateSelectionOrder()
                 }
-                updateSelectionOrder()
                 loadError = nil
             case let .failure(.message(message)):
                 items = []
@@ -826,6 +856,25 @@ private struct FolderBrowser: View {
                 controller.updateCurrentDirectoryItems([])
                 loadError = message
             }
+        }
+    }
+
+    private func updateDropFocus(for id: String, isTargeted: Bool) {
+        if isTargeted {
+            activeDropTargetIDs.insert(id)
+            dropFocusGeneration = UUID()
+            browserDropFocus = true
+            return
+        }
+
+        activeDropTargetIDs.remove(id)
+        guard activeDropTargetIDs.isEmpty else { return }
+
+        let generation = UUID()
+        dropFocusGeneration = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            guard dropFocusGeneration == generation, activeDropTargetIDs.isEmpty else { return }
+            browserDropFocus = false
         }
     }
 
@@ -843,14 +892,36 @@ private struct FolderBrowser: View {
 
     nonisolated private static func readItems(in folder: URL) -> Result<[BrowserItem], DirectoryLoadFailure> {
         do {
+            let resourceKeys: Set<URLResourceKey> = [
+                .isDirectoryKey,
+                .isHiddenKey,
+                .fileSizeKey,
+                .contentModificationDateKey,
+                .tagNamesKey
+            ]
             let urls = try FileManager.default.contentsOfDirectory(
                 at: folder,
-                includingPropertiesForKeys: [.isDirectoryKey, .isHiddenKey],
+                includingPropertiesForKeys: Array(resourceKeys),
                 options: [.skipsHiddenFiles]
             )
-            let items = urls.compactMap { url -> BrowserItem? in
-                let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
-                return BrowserItem(url: url, isDirectory: values?.isDirectory ?? false)
+            let items = urls.map { url -> BrowserItem in
+                let values = try? url.resourceValues(forKeys: resourceKeys)
+                let isDirectory = values?.isDirectory ?? false
+                let kind = isDirectory
+                    ? "Folder"
+                    : (url.pathExtension.isEmpty ? "Document" : url.pathExtension.uppercased())
+                return BrowserItem(
+                    url: url,
+                    isDirectory: isDirectory,
+                    kind: kind,
+                    size: values?.fileSize ?? 0,
+                    modificationDate: values?.contentModificationDate,
+                    tags: FinderTag.tags(
+                        for: url,
+                        knownTagNames: values?.tagNames ?? [],
+                        maximumCacheAge: 0
+                    )
+                )
             }
             .sorted {
                 if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
@@ -862,7 +933,7 @@ private struct FolderBrowser: View {
         }
     }
 
-    private var listView: some View {
+    private func listView(items displayedItems: [BrowserItem], orderedURLs displayedURLs: [URL]) -> some View {
         GeometryReader { proxy in
             ScrollView(.horizontal, showsIndicators: true) {
                 VStack(spacing: 0) {
@@ -896,16 +967,18 @@ private struct FolderBrowser: View {
                                     controller: controller
                                 )
                             }
-                            ForEach(visibleItems) { item in
+                            ForEach(displayedItems) { item in
                                 BrowserListRow(
                                     item: item,
-                                    orderedURLs: visibleItems.map(\.url),
+                                    orderedURLs: displayedURLs,
                                     nameWidth: nameWidth,
                                     kindWidth: kindWidth,
                                     sizeWidth: sizeWidth,
                                     dateWidth: dateWidth,
-                                    refreshTick: tagRefreshTick,
-                                    controller: controller
+                                    controller: controller,
+                                    onDropFocusChanged: {
+                                        updateDropFocus(for: item.url.path, isTargeted: $0)
+                                    }
                                 )
                             }
                         }
@@ -1154,8 +1227,8 @@ private struct InlineNameField: View {
 private struct BrowserItemTile: View {
     let item: BrowserItem
     let orderedURLs: [URL]
-    let refreshTick: Int
     @ObservedObject var controller: DockController
+    let onDropFocusChanged: (Bool) -> Void
     @State private var isFileDropTarget = false
 
     private var isSelected: Bool { controller.selectedItemURLs.contains(item.url) }
@@ -1165,22 +1238,33 @@ private struct BrowserItemTile: View {
     }
 
     var body: some View {
-        VStack(spacing: 7) {
-            if item.isDirectory {
-                FileIcon(url: item.url, size: 42, tint: item.tags.first?.color)
-            } else {
-                FilePreview(url: item.url, size: 42)
+        FinderDragSource(
+            urls: urlsForDrag,
+            primaryAction: { controller.selectItem(item.url, orderedURLs: orderedURLs) },
+            doubleAction: { controller.openInBrowser(item.url) },
+            dragEnded: controller.externalFileDragEnded,
+            isEnabled: !isRenaming
+        ) {
+            VStack(spacing: 7) {
+                if item.isDirectory {
+                    FileIcon(url: item.url, size: 42, tint: item.tags.first?.color)
+                } else {
+                    FilePreview(url: item.url, size: 42, modificationDate: item.modificationDate)
+                }
+                if isRenaming {
+                    InlineNameField(controller: controller, centered: true)
+                } else {
+                    Text(item.name)
+                        .font(.system(size: 10, weight: .medium))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
+                }
+                FinderTagDots(tags: item.tags, size: 6)
             }
-            if isRenaming {
-                InlineNameField(controller: controller, centered: true)
-            } else {
-                Text(item.name)
-                    .font(.system(size: 10, weight: .medium))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity)
+            .contextMenu {
+                FileItemContextMenu(item: item, controller: controller)
             }
-            FinderTagDots(tags: item.tags, size: 6)
         }
         .padding(.vertical, 7)
         .frame(maxWidth: .infinity, minHeight: 78, alignment: .top)
@@ -1210,20 +1294,25 @@ private struct BrowserItemTile: View {
                 .help("Browse this folder")
             }
         }
-        .onTapGesture(count: 2) {
-            controller.openInBrowser(item.url)
-        }
-        .onTapGesture {
-            controller.selectItem(item.url, orderedURLs: orderedURLs)
-        }
-        .draggable(item.url)
         .onDrop(of: [.fileURL], isTargeted: $isFileDropTarget) { providers in
             guard item.isDirectory else { return false }
             return controller.receiveFileDrop(providers, into: item.url)
         }
-        .contextMenu {
-            FileItemContextMenu(item: item, controller: controller)
+        .onChange(of: isFileDropTarget) { _, targeted in
+            onDropFocusChanged(targeted)
         }
+        .onDisappear {
+            if isFileDropTarget {
+                onDropFocusChanged(false)
+            }
+        }
+    }
+
+    private func urlsForDrag() -> [URL] {
+        if !controller.selectedItemURLs.contains(item.url) {
+            controller.selectOnly(item.url)
+        }
+        return controller.selectedItemsOr(item.url)
     }
 }
 
@@ -1234,8 +1323,8 @@ private struct BrowserListRow: View {
     let kindWidth: CGFloat
     let sizeWidth: CGFloat
     let dateWidth: CGFloat
-    let refreshTick: Int
     @ObservedObject var controller: DockController
+    let onDropFocusChanged: (Bool) -> Void
     @State private var isFileDropTarget = false
 
     private var isSelected: Bool { controller.selectedItemURLs.contains(item.url) }
@@ -1243,11 +1332,10 @@ private struct BrowserListRow: View {
         if case let .rename(url) = controller.prompt { return url == item.url }
         return false
     }
-    private var kind: String { item.isDirectory ? "Folder" : (item.url.pathExtension.isEmpty ? "Document" : item.url.pathExtension.uppercased()) }
+    private var kind: String { item.kind }
     private var size: String {
-        guard !item.isDirectory,
-              let bytes = try? item.url.resourceValues(forKeys: [.fileSizeKey]).fileSize else { return "—" }
-        return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+        guard !item.isDirectory else { return "—" }
+        return ByteCountFormatter.string(fromByteCount: Int64(item.size), countStyle: .file)
     }
     private var modified: String {
         guard let date = item.modificationDate else { return "—" }
@@ -1255,48 +1343,48 @@ private struct BrowserListRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 12) {
-            HStack(spacing: 8) {
-                if item.isDirectory {
-                    FileIcon(url: item.url, size: 22, tint: item.tags.first?.color)
-                } else {
-                    FilePreview(url: item.url, size: 22)
-                }
-                if isRenaming {
-                    InlineNameField(controller: controller, centered: false)
-                } else {
-                    Text(item.name)
-                        .font(.system(size: 12, weight: .medium))
-                        .lineLimit(1)
-                }
-                FinderTagDots(tags: item.tags)
-                Spacer(minLength: 4)
-                if item.isDirectory {
-                    Button {
-                        controller.openInBrowser(item.url)
-                    } label: {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 8, weight: .bold))
-                            .frame(width: 18, height: 18)
+        FinderDragSource(
+            urls: urlsForDrag,
+            primaryAction: { controller.selectItem(item.url, orderedURLs: orderedURLs) },
+            doubleAction: { controller.openInBrowser(item.url) },
+            dragEnded: controller.externalFileDragEnded,
+            isEnabled: !isRenaming
+        ) {
+            HStack(spacing: 12) {
+                HStack(spacing: 8) {
+                    if item.isDirectory {
+                        FileIcon(url: item.url, size: 22, tint: item.tags.first?.color)
+                    } else {
+                        FilePreview(url: item.url, size: 22, modificationDate: item.modificationDate)
                     }
-                    .buttonStyle(.plain)
-                    .help("Browse this folder")
+                    if isRenaming {
+                        InlineNameField(controller: controller, centered: false)
+                    } else {
+                        Text(item.name)
+                            .font(.system(size: 12, weight: .medium))
+                            .lineLimit(1)
+                    }
+                    FinderTagDots(tags: item.tags)
+                    Spacer(minLength: 26)
                 }
+                .frame(width: nameWidth, alignment: .leading)
+                Text(kind)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .frame(width: kindWidth, alignment: .leading)
+                Text(size)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .frame(width: sizeWidth, alignment: .trailing)
+                Text(modified)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(width: dateWidth, alignment: .leading)
             }
-            .frame(width: nameWidth, alignment: .leading)
-            Text(kind)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .frame(width: kindWidth, alignment: .leading)
-            Text(size)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .frame(width: sizeWidth, alignment: .trailing)
-            Text(modified)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .frame(width: dateWidth, alignment: .leading)
+            .contextMenu {
+                FileItemContextMenu(item: item, controller: controller)
+            }
         }
         .padding(.leading, 20)
         .padding(.trailing, 12)
@@ -1309,20 +1397,40 @@ private struct BrowserListRow: View {
                     .strokeBorder(Color.accentColor, lineWidth: 2)
             }
         }
-        .onTapGesture(count: 2) {
-            controller.openInBrowser(item.url)
+        .overlay(alignment: .leading) {
+            if item.isDirectory {
+                Button {
+                    controller.openInBrowser(item.url)
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .bold))
+                        .frame(width: 22, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Browse this folder")
+                .offset(x: 20 + nameWidth - 24)
+            }
         }
-        .onTapGesture {
-            controller.selectItem(item.url, orderedURLs: orderedURLs)
-        }
-        .draggable(item.url)
         .onDrop(of: [.fileURL], isTargeted: $isFileDropTarget) { providers in
             guard item.isDirectory else { return false }
             return controller.receiveFileDrop(providers, into: item.url)
         }
-        .contextMenu {
-            FileItemContextMenu(item: item, controller: controller)
+        .onChange(of: isFileDropTarget) { _, targeted in
+            onDropFocusChanged(targeted)
         }
+        .onDisappear {
+            if isFileDropTarget {
+                onDropFocusChanged(false)
+            }
+        }
+    }
+
+    private func urlsForDrag() -> [URL] {
+        if !controller.selectedItemURLs.contains(item.url) {
+            controller.selectOnly(item.url)
+        }
+        return controller.selectedItemsOr(item.url)
     }
 }
 
@@ -1368,18 +1476,39 @@ struct FileIcon: View {
     var tint: Color? = nil
 
     var body: some View {
+        let icon = FileIconCache.icon(for: url)
+
         Group {
             if let tint {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: url.path))
+                Image(nsImage: icon)
                     .resizable()
                     .renderingMode(.template)
                     .foregroundStyle(tint)
             } else {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: url.path))
+                Image(nsImage: icon)
                     .resizable()
                     .interpolation(.high)
             }
         }
         .frame(width: size, height: size)
+    }
+}
+
+@MainActor
+private enum FileIconCache {
+    static let images: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 512
+        return cache
+    }()
+
+    static func icon(for url: URL) -> NSImage {
+        let key = url.path as NSString
+        if let image = images.object(forKey: key) {
+            return image
+        }
+        let image = NSWorkspace.shared.icon(forFile: url.path)
+        images.setObject(image, forKey: key)
+        return image
     }
 }

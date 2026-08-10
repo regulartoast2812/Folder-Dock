@@ -63,8 +63,14 @@ final class DockController: ObservableObject {
         hasStarted = true
         NSApp.setActivationPolicy(.accessory)
 
-        hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
+        // Build the shelf before the first hover so SwiftUI/AppKit initialization never
+        // lands on the reveal path. Keep it ordered out until the pointer reaches the edge.
+        let shelf = makeShelfPanelIfNeeded()
+        positionShelf(shelf)
+        shelf.orderOut(nil)
+
+        hoverTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
                 self?.checkPointerPosition()
             }
         }
@@ -530,6 +536,14 @@ final class DockController: ObservableObject {
         directoryRevision = UUID()
     }
 
+    func externalFileDragEnded(with operation: NSDragOperation) {
+        guard operation.contains(.move) else { return }
+        clearSelection()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.refreshFolder()
+        }
+    }
+
     func createNewFolder() {
         guard let currentFolder else { return }
         promptText = "Untitled Folder"
@@ -720,7 +734,11 @@ final class DockController: ObservableObject {
         if isInteractionLocked {
             cancelDismissal()
         } else if inHotZone {
-            show()
+            if hasVisiblePanel {
+                cancelDismissal()
+            } else {
+                show()
+            }
         } else if hasVisiblePanel && !pointerIsInsideVisiblePanel(location) {
             scheduleDismissal()
         } else {
