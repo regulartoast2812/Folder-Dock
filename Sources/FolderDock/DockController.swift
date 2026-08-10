@@ -44,10 +44,42 @@ enum BatchRenameFormat: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-private struct BatchRenamePlan {
+private struct FileMove: Sendable {
     let source: URL
-    let temporary: URL
     let destination: URL
+}
+
+private struct FinderTagSnapshot: Sendable {
+    let url: URL
+    let tags: [String]
+}
+
+private enum FileUndoOperation {
+    case move([FileMove])
+    case recycle([URL])
+    case restoreTags([FinderTagSnapshot])
+}
+
+private struct FileUndoEntry {
+    let title: String
+    let operation: FileUndoOperation
+}
+
+private final class DroppedURLCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var urls: [URL] = []
+
+    func append(_ url: URL) {
+        lock.lock()
+        urls.append(url)
+        lock.unlock()
+    }
+
+    func snapshot() -> [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        return urls
+    }
 }
 
 @MainActor
@@ -67,6 +99,7 @@ final class DockController: ObservableObject {
     private var shelfResizeStartMouseX: CGFloat?
     private var browserResizeBaseSize: NSSize?
     private var browserResizeStartMouse: NSPoint?
+    private var fileUndoStack: [FileUndoEntry] = []
     private var navigationHistory: [URL] = []
     private var historyIndex = -1
     @Published private(set) var currentFolder: URL?
@@ -324,6 +357,74 @@ final class DockController: ObservableObject {
         selectionAnchorURL = currentDirectoryItemURLs.first
     }
 
+    func undoLastFileAction() {
+        guard let entry = fileUndoStack.popLast() else {
+            NSSound.beep()
+            return
+        }
+
+        switch entry.operation {
+        case let .move(moves):
+            do {
+                try Self.moveItemsAtomically(moves)
+                let restoredURLs = moves.map(\.destination)
+                selectedItemURLs = Set(restoredURLs)
+                selectionAnchorURL = restoredURLs.first
+                cancelPrompt()
+                refreshFolder()
+            } catch {
+                restoreFailedUndo(entry, error: error)
+            }
+
+        case let .recycle(urls):
+            let existingURLs = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
+            guard !existingURLs.isEmpty else {
+                restoreFailedUndo(entry, message: "The items for \(entry.title.lowercased()) are no longer available.")
+                return
+            }
+            NSWorkspace.shared.recycle(existingURLs) { [weak self] _, error in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if let error {
+                        self.restoreFailedUndo(entry, error: error)
+                    } else {
+                        self.clearSelection()
+                        self.cancelPrompt()
+                        self.refreshFolder()
+                    }
+                }
+            }
+
+        case let .restoreTags(snapshots):
+            do {
+                for snapshot in snapshots {
+                    try setFinderTags(snapshot.tags, for: snapshot.url)
+                }
+                cancelPrompt()
+                refreshFolder()
+            } catch {
+                restoreFailedUndo(entry, error: error)
+            }
+        }
+    }
+
+    private func registerFileUndo(_ title: String, operation: FileUndoOperation) {
+        fileUndoStack.append(FileUndoEntry(title: title, operation: operation))
+        if fileUndoStack.count > 50 {
+            fileUndoStack.removeFirst(fileUndoStack.count - 50)
+        }
+    }
+
+    private func restoreFailedUndo(_ entry: FileUndoEntry, error: Error) {
+        restoreFailedUndo(entry, message: error.localizedDescription)
+    }
+
+    private func restoreFailedUndo(_ entry: FileUndoEntry, message: String) {
+        fileUndoStack.append(entry)
+        prompt = .error("Couldn’t undo \(entry.title.lowercased()): \(message)")
+        activateForInput()
+    }
+
     func openSelectedItem() {
         openItems(Array(selectedItemURLs))
     }
@@ -426,7 +527,7 @@ final class DockController: ObservableObject {
         let urls = objects.map { $0 as URL }
         guard !urls.isEmpty else { return }
         let shouldMove = forceMove || urls.allSatisfy { pendingCutURLs.contains($0.standardizedFileURL) }
-        urls.forEach { transfer($0, into: currentFolder, copying: !shouldMove) }
+        transfer(urls, into: currentFolder, copying: !shouldMove)
         if shouldMove { pendingCutURLs = [] }
     }
 
@@ -443,6 +544,7 @@ final class DockController: ObservableObject {
 
     func addFinderTag(name: String, colorIndex: Int, to urls: [URL]) {
         guard !urls.isEmpty else { return }
+        var snapshots: [FinderTagSnapshot] = []
         for url in urls {
             let existing = (try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames) ?? []
             let withoutSameName = existing.filter {
@@ -451,28 +553,53 @@ final class DockController: ObservableObject {
             let tag = "\(name)\n\(colorIndex)"
             do {
                 try setFinderTags(withoutSameName + [tag], for: url)
+                snapshots.append(FinderTagSnapshot(url: url, tags: existing))
             } catch {
                 prompt = .error("Couldn’t tag \(url.lastPathComponent): \(error.localizedDescription)")
             }
+        }
+        if !snapshots.isEmpty {
+            registerFileUndo("Add Tag", operation: .restoreTags(snapshots))
         }
         refreshFolder()
     }
 
     func removeFinderTag(named name: String, from urls: [URL]) {
         guard !urls.isEmpty else { return }
+        var snapshots: [FinderTagSnapshot] = []
         for url in urls {
             let existing = (try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames) ?? []
             let remaining = existing.filter {
                 $0.split(separator: "\n", maxSplits: 1).first.map(String.init)?.caseInsensitiveCompare(name) != .orderedSame
             }
-            try? setFinderTags(remaining, for: url)
+            do {
+                try setFinderTags(remaining, for: url)
+                snapshots.append(FinderTagSnapshot(url: url, tags: existing))
+            } catch {
+                prompt = .error("Couldn’t update \(url.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+        if !snapshots.isEmpty {
+            registerFileUndo("Remove Tag", operation: .restoreTags(snapshots))
         }
         refreshFolder()
     }
 
     func clearFinderTags(from urls: [URL]) {
         guard !urls.isEmpty else { return }
-        urls.forEach { try? setFinderTags([], for: $0) }
+        var snapshots: [FinderTagSnapshot] = []
+        for url in urls {
+            let existing = (try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames) ?? []
+            do {
+                try setFinderTags([], for: url)
+                snapshots.append(FinderTagSnapshot(url: url, tags: existing))
+            } catch {
+                prompt = .error("Couldn’t clear tags from \(url.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+        if !snapshots.isEmpty {
+            registerFileUndo("Clear Tags", operation: .restoreTags(snapshots))
+        }
         refreshFolder()
     }
 
@@ -515,6 +642,12 @@ final class DockController: ObservableObject {
             }
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                if !duplicates.isEmpty {
+                    self.registerFileUndo(
+                        duplicates.count == 1 ? "Duplicate" : "Duplicate \(duplicates.count) Items",
+                        operation: .recycle(duplicates)
+                    )
+                }
                 self.selectedItemURLs = Set(duplicates)
                 self.selectionAnchorURL = duplicates.first
                 self.refreshFolder()
@@ -570,10 +703,23 @@ final class DockController: ObservableObject {
 
     func moveToTrash(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
-        NSWorkspace.shared.recycle(urls) { [weak self] _, _ in
+        NSWorkspace.shared.recycle(urls) { [weak self] mapping, error in
             Task { @MainActor [weak self] in
-                self?.clearSelection()
-                self?.refreshFolder()
+                guard let self else { return }
+                let moves = mapping.map { original, trashed in
+                    FileMove(source: trashed.standardizedFileURL, destination: original.standardizedFileURL)
+                }
+                if !moves.isEmpty {
+                    self.registerFileUndo(
+                        moves.count == 1 ? "Move to Trash" : "Move \(moves.count) Items to Trash",
+                        operation: .move(moves)
+                    )
+                }
+                if let error {
+                    self.prompt = .error(error.localizedDescription)
+                }
+                self.clearSelection()
+                self.refreshFolder()
             }
         }
     }
@@ -645,6 +791,7 @@ final class DockController: ObservableObject {
         prompt = nil
         promptText = ""
         batchRenameError = nil
+        browserPanel?.makeFirstResponder(nil)
     }
 
     func confirmPrompt() {
@@ -667,6 +814,7 @@ final class DockController: ObservableObject {
         let destination = parent.appendingPathComponent(name, isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+            registerFileUndo("New Folder", operation: .recycle([destination]))
             selectedItemURLs = [destination]
             selectionAnchorURL = destination
             cancelPrompt()
@@ -687,6 +835,10 @@ final class DockController: ObservableObject {
         }
         do {
             try FileManager.default.moveItem(at: source, to: destination)
+            registerFileUndo(
+                "Rename",
+                operation: .move([FileMove(source: destination, destination: source)])
+            )
             selectedItemURLs = [destination]
             selectionAnchorURL = destination
             cancelPrompt()
@@ -703,7 +855,7 @@ final class DockController: ObservableObject {
         let sources = urls.map(\.standardizedFileURL)
         let sourcePathKeys = Set(sources.map { normalizedFilenameKey($0.path) })
         var destinationNameKeys = Set<String>()
-        var plans: [BatchRenamePlan] = []
+        var plans: [FileMove] = []
         var destinations: [URL] = []
 
         for (offset, source) in sources.enumerated() {
@@ -736,9 +888,7 @@ final class DockController: ObservableObject {
 
             destinations.append(destination)
             guard destination.path != source.path else { continue }
-            let temporary = source.deletingLastPathComponent()
-                .appendingPathComponent(".folder-dock-rename-\(UUID().uuidString)", isDirectory: isDirectory)
-            plans.append(BatchRenamePlan(source: source, temporary: temporary, destination: destination))
+            plans.append(FileMove(source: source, destination: destination))
         }
 
         guard !plans.isEmpty else {
@@ -746,36 +896,17 @@ final class DockController: ObservableObject {
             return
         }
 
-        var staged: [BatchRenamePlan] = []
         do {
-            for plan in plans {
-                try FileManager.default.moveItem(at: plan.source, to: plan.temporary)
-                staged.append(plan)
-            }
+            try Self.moveItemsAtomically(plans)
         } catch {
-            for plan in staged.reversed() {
-                try? FileManager.default.moveItem(at: plan.temporary, to: plan.source)
-            }
             batchRenameError = error.localizedDescription
             return
         }
 
-        var completed: [BatchRenamePlan] = []
-        do {
-            for plan in plans {
-                try FileManager.default.moveItem(at: plan.temporary, to: plan.destination)
-                completed.append(plan)
-            }
-        } catch {
-            for plan in completed.reversed() {
-                try? FileManager.default.moveItem(at: plan.destination, to: plan.temporary)
-            }
-            for plan in plans.reversed() where FileManager.default.fileExists(atPath: plan.temporary.path) {
-                try? FileManager.default.moveItem(at: plan.temporary, to: plan.source)
-            }
-            batchRenameError = error.localizedDescription
-            return
-        }
+        registerFileUndo(
+            "Rename \(plans.count) Items",
+            operation: .move(plans.map { FileMove(source: $0.destination, destination: $0.source) })
+        )
 
         selectedItemURLs = Set(destinations)
         selectionAnchorURL = destinations.first
@@ -836,34 +967,104 @@ final class DockController: ObservableObject {
         value.precomposedStringWithCanonicalMapping.lowercased()
     }
 
-    func receiveFileDrop(_ providers: [NSItemProvider], into destination: URL) -> Bool {
-        guard !providers.isEmpty else { return false }
-        let shouldCopy = NSEvent.modifierFlags.contains(.option)
+    private nonisolated static func moveItemsAtomically(_ moves: [FileMove]) throws {
+        let moves = moves.filter { $0.source.standardizedFileURL.path != $0.destination.standardizedFileURL.path }
+        guard !moves.isEmpty else { return }
 
-        for provider in providers {
+        func pathKey(_ url: URL) -> String {
+            url.standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+        }
+        func failure(_ message: String) -> NSError {
+            NSError(domain: "FolderDock.FileUndo", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+
+        let sourceKeys = Set(moves.map { pathKey($0.source) })
+        guard sourceKeys.count == moves.count else {
+            throw failure("The same source item appears more than once.")
+        }
+
+        var destinationKeys = Set<String>()
+        for move in moves {
+            guard FileManager.default.fileExists(atPath: move.source.path) else {
+                throw failure("\(move.source.lastPathComponent) is no longer available.")
+            }
+            guard destinationKeys.insert(pathKey(move.destination)).inserted else {
+                throw failure("Two items would be restored to the same name.")
+            }
+            if FileManager.default.fileExists(atPath: move.destination.path),
+               !sourceKeys.contains(pathKey(move.destination)) {
+                throw failure("\(move.destination.lastPathComponent) already exists.")
+            }
+        }
+
+        var staged: [(move: FileMove, temporary: URL)] = []
+        do {
+            for move in moves {
+                let isDirectory = (try? move.source.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                let temporary = move.source.deletingLastPathComponent()
+                    .appendingPathComponent(".folder-dock-undo-\(UUID().uuidString)", isDirectory: isDirectory)
+                try FileManager.default.moveItem(at: move.source, to: temporary)
+                staged.append((move, temporary))
+            }
+        } catch {
+            for item in staged.reversed() where FileManager.default.fileExists(atPath: item.temporary.path) {
+                try? FileManager.default.moveItem(at: item.temporary, to: item.move.source)
+            }
+            throw error
+        }
+
+        var completed: [(move: FileMove, temporary: URL)] = []
+        do {
+            for item in staged {
+                try FileManager.default.moveItem(at: item.temporary, to: item.move.destination)
+                completed.append(item)
+            }
+        } catch {
+            for item in completed.reversed() where FileManager.default.fileExists(atPath: item.move.destination.path) {
+                try? FileManager.default.moveItem(at: item.move.destination, to: item.temporary)
+            }
+            for item in staged.reversed() where FileManager.default.fileExists(atPath: item.temporary.path) {
+                try? FileManager.default.moveItem(at: item.temporary, to: item.move.source)
+            }
+            throw error
+        }
+    }
+
+    func receiveFileDrop(_ providers: [NSItemProvider], into destination: URL) -> Bool {
+        let supportedProviders = providers.filter {
+            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+                || $0.hasItemConformingToTypeIdentifier(UTType.url.identifier)
+        }
+        guard !supportedProviders.isEmpty else { return false }
+        let shouldCopy = NSEvent.modifierFlags.contains(.option)
+        let collector = DroppedURLCollector()
+        let group = DispatchGroup()
+
+        for provider in supportedProviders {
             let type = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
                 ? UTType.fileURL.identifier
                 : UTType.url.identifier
-            guard provider.hasItemConformingToTypeIdentifier(type) else { continue }
-            provider.loadItem(forTypeIdentifier: type, options: nil) { [weak self] item, _ in
+            group.enter()
+            provider.loadItem(forTypeIdentifier: type, options: nil) { item, _ in
+                defer { group.leave() }
                 let url: URL?
                 if let data = item as? Data {
                     url = URL(dataRepresentation: data, relativeTo: nil)
                 } else {
                     url = item as? URL
                 }
-                guard let url else { return }
-                Task { @MainActor [weak self] in
-                    self?.transfer(url, into: destination, copying: shouldCopy)
-                }
+                if let url { collector.append(url) }
             }
+        }
+        group.notify(queue: .main) { [weak self] in
+            self?.transfer(collector.snapshot(), into: destination, copying: shouldCopy)
         }
         return true
     }
 
     func receiveURLs(_ urls: [URL], into destination: URL) {
         let shouldCopy = NSEvent.modifierFlags.contains(.option)
-        urls.forEach { transfer($0, into: destination, copying: shouldCopy) }
+        transfer(urls, into: destination, copying: shouldCopy)
     }
 
     func closeBrowser() {
@@ -1046,28 +1247,67 @@ final class DockController: ObservableObject {
         clearSelection()
     }
 
-    private func transfer(_ source: URL, into destinationFolder: URL, copying: Bool) {
-        let source = source.standardizedFileURL
+    private func transfer(_ sources: [URL], into destinationFolder: URL, copying: Bool) {
         let destinationFolder = destinationFolder.standardizedFileURL
-        guard source.deletingLastPathComponent() != destinationFolder,
-              source.path != destinationFolder.path,
-              !destinationFolder.path.hasPrefix(source.path + "/") else { return }
+        var targetPaths = Set<String>()
+        let plans = sources.map(\.standardizedFileURL).compactMap { source -> FileMove? in
+            guard source.deletingLastPathComponent() != destinationFolder,
+                  source.path != destinationFolder.path,
+                  !destinationFolder.path.hasPrefix(source.path + "/") else { return nil }
 
-        let target = destinationFolder.appendingPathComponent(source.lastPathComponent, isDirectory: source.hasDirectoryPath)
-        guard !FileManager.default.fileExists(atPath: target.path) else { return }
+            let target = destinationFolder.appendingPathComponent(
+                source.lastPathComponent,
+                isDirectory: source.hasDirectoryPath
+            )
+            let targetKey = target.path.precomposedStringWithCanonicalMapping.lowercased()
+            guard targetPaths.insert(targetKey).inserted,
+                  !FileManager.default.fileExists(atPath: target.path) else { return nil }
+            return FileMove(source: source, destination: target)
+        }
+        guard !plans.isEmpty else { return }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var completed: [FileMove] = []
             do {
-                if copying {
-                    try FileManager.default.copyItem(at: source, to: target)
-                } else {
-                    try FileManager.default.moveItem(at: source, to: target)
+                for plan in plans {
+                    if copying {
+                        try FileManager.default.copyItem(at: plan.source, to: plan.destination)
+                    } else {
+                        try FileManager.default.moveItem(at: plan.source, to: plan.destination)
+                    }
+                    completed.append(plan)
                 }
                 Task { @MainActor [weak self] in
-                    self?.refreshFolder()
+                    guard let self else { return }
+                    let targets = plans.map(\.destination)
+                    if copying {
+                        self.registerFileUndo(
+                            targets.count == 1 ? "Copy Item" : "Copy \(targets.count) Items",
+                            operation: .recycle(targets)
+                        )
+                    } else {
+                        self.registerFileUndo(
+                            targets.count == 1 ? "Move Item" : "Move \(targets.count) Items",
+                            operation: .move(plans.map { FileMove(source: $0.destination, destination: $0.source) })
+                        )
+                    }
+                    self.selectedItemURLs = Set(targets)
+                    self.selectionAnchorURL = targets.first
+                    self.refreshFolder()
                 }
             } catch {
-                // Existing files and failed cross-volume transfers remain untouched.
+                for plan in completed.reversed() {
+                    if copying {
+                        try? FileManager.default.removeItem(at: plan.destination)
+                    } else {
+                        try? FileManager.default.moveItem(at: plan.destination, to: plan.source)
+                    }
+                }
+                Task { @MainActor [weak self] in
+                    self?.prompt = .error(error.localizedDescription)
+                    self?.activateForInput()
+                    self?.refreshFolder()
+                }
             }
         }
     }
@@ -1119,6 +1359,19 @@ final class DockController: ObservableObject {
         let shift = modifiers.contains(.shift)
         let option = modifiers.contains(.option)
         let key = event.charactersIgnoringModifiers?.lowercased()
+
+        let isRenamingText: Bool
+        switch prompt {
+        case .newFolder, .rename, .batchRename: isRenamingText = true
+        case .info, .error, .none: isRenamingText = false
+        }
+        let hasFocusedTextEditor = shelfPanel?.firstResponder is NSTextView
+            || browserPanel?.firstResponder is NSTextView
+        if command && !shift && key == "z", currentFolder != nil {
+            guard !isRenamingText, !hasFocusedTextEditor else { return event }
+            undoLastFileAction()
+            return nil
+        }
 
         if command && option && event.keyCode == 123 { switchSet(forward: false); return nil } // Option-Command-Left
         if command && option && event.keyCode == 124 { switchSet(forward: true); return nil }  // Option-Command-Right

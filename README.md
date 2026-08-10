@@ -43,6 +43,7 @@ Drag files or folders from Finder onto the open browser to move them into that f
 - `⌘↑`: enclosing folder
 - `Return`: rename one selected item inline, or open Finder-style batch rename for multiple items
 - `⌘O`: open the selected item or items
+- `⌘Z`: undo the last reversible file action
 - `Space`: Quick Look the selected item
 - `⇧⌘N`: new folder
 - `⌘R`: refresh
