@@ -18,7 +18,7 @@ Saved folders are stored locally in the app's User Defaults. Click a folder to o
 3. On first launch, right-click **Folder Dock.app** and choose **Open** if macOS shows an unidentified-developer warning.
 4. Enable **Folder Dock** in **System Settings → Privacy & Security → App Management**. This one-time permission lets Sparkle replace the installed app when a signed update is ready.
 
-Folder Dock also shows this App Management reminder once inside the app. The same shortcut remains available under **Settings → Updates**.
+The App Management shortcut remains available under **Settings → Updates** if a teammate needs to enable or review it later. Folder Dock does not interrupt launch with a permission reminder.
 
 ## Publishing updates
 

@@ -3,11 +3,18 @@ import SwiftUI
 
 struct PointerContextAction {
     let title: String
+    let systemImageName: String?
     let isDestructive: Bool
     let action: () -> Void
 
-    init(title: String, isDestructive: Bool = false, action: @escaping () -> Void) {
+    init(
+        title: String,
+        systemImageName: String? = nil,
+        isDestructive: Bool = false,
+        action: @escaping () -> Void
+    ) {
         self.title = title
+        self.systemImageName = systemImageName
         self.isDestructive = isDestructive
         self.action = action
     }
@@ -127,7 +134,10 @@ final class PointerButtonView<Content: View>: NSHostingView<Content> {
             let item = NSMenuItem(title: contextAction.title, action: #selector(runContextAction(_:)), keyEquivalent: "")
             item.target = self
             item.tag = index
-            if contextAction.isDestructive { item.attributedTitle = NSAttributedString(string: contextAction.title, attributes: [.foregroundColor: NSColor.systemRed]) }
+            if let systemImageName = contextAction.systemImageName {
+                item.image = NSImage(systemSymbolName: systemImageName, accessibilityDescription: contextAction.title)
+                item.image?.isTemplate = true
+            }
             menu.addItem(item)
         }
         NSMenu.popUpContextMenu(menu, with: event, for: self)

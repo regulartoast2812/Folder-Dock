@@ -8,6 +8,7 @@ struct FinderDragSource<Label: View>: NSViewRepresentable {
     let primaryAction: () -> Void
     let doubleAction: () -> Void
     let dragEnded: (NSDragOperation) -> Void
+    let contextMenuProvider: () -> NSMenu?
     let isEnabled: Bool
     let label: Label
 
@@ -16,6 +17,7 @@ struct FinderDragSource<Label: View>: NSViewRepresentable {
         primaryAction: @escaping () -> Void,
         doubleAction: @escaping () -> Void,
         dragEnded: @escaping (NSDragOperation) -> Void = { _ in },
+        contextMenu: @escaping () -> NSMenu? = { nil },
         isEnabled: Bool = true,
         @ViewBuilder label: () -> Label
     ) {
@@ -23,6 +25,7 @@ struct FinderDragSource<Label: View>: NSViewRepresentable {
         self.primaryAction = primaryAction
         self.doubleAction = doubleAction
         self.dragEnded = dragEnded
+        self.contextMenuProvider = contextMenu
         self.isEnabled = isEnabled
         self.label = label()
     }
@@ -43,6 +46,7 @@ struct FinderDragSource<Label: View>: NSViewRepresentable {
         view.primaryAction = primaryAction
         view.doubleAction = doubleAction
         view.dragEnded = dragEnded
+        view.contextMenuProvider = contextMenuProvider
         view.isDragEnabled = isEnabled
     }
 }
@@ -52,6 +56,7 @@ final class FinderDragSourceView<Content: View>: NSView, NSDraggingSource {
     var primaryAction: () -> Void = {}
     var doubleAction: () -> Void = {}
     var dragEnded: (NSDragOperation) -> Void = { _ in }
+    var contextMenuProvider: () -> NSMenu? = { nil }
     var isDragEnabled = true
 
     private let hostingView: NSHostingView<Content>
@@ -83,13 +88,17 @@ final class FinderDragSourceView<Content: View>: NSView, NSDraggingSource {
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard bounds.contains(point) else { return nil }
         let event = NSApp.currentEvent
-        let routesToHostedContent = event?.type == .rightMouseDown
+        let requestsContextMenu = event?.type == .rightMouseDown
             || event?.type == .rightMouseUp
             || (event?.type == .leftMouseDown && event?.modifierFlags.contains(.control) == true)
-        if isDragEnabled && !routesToHostedContent {
+        if requestsContextMenu || isDragEnabled {
             return self
         }
         return hostingView.hitTest(convert(point, to: hostingView))
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        contextMenuProvider()
     }
 
     override var acceptsFirstResponder: Bool { false }

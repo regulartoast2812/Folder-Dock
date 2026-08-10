@@ -340,7 +340,11 @@ private struct FolderSetTab: View {
         .onTapGesture { if !isEditing { select() } }
         .onTapGesture(count: 2, perform: startEditing)
         .contextMenu {
-            Button("Rename Set") { startEditing() }
+            Button {
+                startEditing()
+            } label: {
+                Label("Rename Set…", systemImage: "pencil")
+            }
         }
         .help(isEditing ? "Press Return to save" : "Click to switch. Double-click to rename.")
         .onDrag {
@@ -382,12 +386,12 @@ private struct FolderTile: View {
             dragStarted: onStartDrag,
             receiveDrop: onReceiveDrop,
             contextActions: [
-                PointerContextAction(title: "Browse Here", action: { controller.browse(folder) }),
-                PointerContextAction(title: "Open in Finder", action: { store.open(folder) }),
-                PointerContextAction(title: "Open in New Finder Window", action: { controller.openInNewFinderWindow(folder) }),
-                PointerContextAction(title: "Show in Finder", action: { store.showInFinder(folder) }),
+                PointerContextAction(title: "Browse Here", systemImageName: "folder", action: { controller.browse(folder) }),
+                PointerContextAction(title: "Open in Finder", systemImageName: "arrow.up.forward.app", action: { store.open(folder) }),
+                PointerContextAction(title: "Open in New Finder Window", systemImageName: "macwindow.badge.plus", action: { controller.openInNewFinderWindow(folder) }),
+                PointerContextAction(title: "Show in Finder", systemImageName: "scope", action: { store.showInFinder(folder) }),
                 PointerContextAction(title: "-", action: {}),
-                PointerContextAction(title: "Remove from Dock", isDestructive: true, action: { store.remove(folder) })
+                PointerContextAction(title: "Remove from Dock", systemImageName: "minus.circle", isDestructive: true, action: { store.remove(folder) })
             ]
         ) {
             VStack(spacing: 4) {
@@ -547,44 +551,10 @@ private struct FinderTagDots: View {
     }
 }
 
-private struct FinderTagMenu: View {
-    let urls: [URL]
-    @ObservedObject var controller: DockController
-
-    private let standardTags: [(String, Int)] = [
-        ("Red", 6), ("Orange", 7), ("Yellow", 5), ("Green", 2),
-        ("Blue", 4), ("Purple", 3), ("Gray", 1)
-    ]
-
-    private var existingTagNames: [String] {
-        Array(Set(urls.flatMap { FinderTag.tags(for: $0).map(\.name) })).sorted()
-    }
-
-    var body: some View {
-        Menu("Tags") {
-            ForEach(standardTags, id: \.0) { name, colorIndex in
-                Button {
-                    controller.addFinderTag(name: name, colorIndex: colorIndex, to: urls)
-                } label: {
-                    HStack(spacing: 7) {
-                        Image(nsImage: FinderTag(name: name, colorIndex: colorIndex).menuImage)
-                            .renderingMode(.original)
-                        Text(name)
-                    }
-                }
-            }
-            if !existingTagNames.isEmpty {
-                Divider()
-                Menu("Remove Tag") {
-                    ForEach(existingTagNames, id: \.self) { name in
-                        Button(name) { controller.removeFinderTag(named: name, from: urls) }
-                    }
-                }
-                Button("Clear Tags") { controller.clearFinderTags(from: urls) }
-            }
-        }
-    }
-}
+private let finderStandardTags: [(name: String, colorIndex: Int)] = [
+    ("Red", 6), ("Orange", 7), ("Yellow", 5), ("Green", 2),
+    ("Blue", 4), ("Purple", 3), ("Gray", 1)
+]
 
 private enum BrowserSortKey: String {
     case name, kind, size, dateModified
@@ -1394,6 +1364,7 @@ private struct BrowserItemTile: View {
             primaryAction: { controller.selectItem(item.url, orderedURLs: orderedURLs) },
             doubleAction: { controller.openInBrowser(item.url) },
             dragEnded: controller.externalFileDragEnded,
+            contextMenu: { makeFileItemContextMenu(item: item, controller: controller) },
             isEnabled: !isRenaming
         ) {
             VStack(spacing: 7) {
@@ -1412,9 +1383,6 @@ private struct BrowserItemTile: View {
                         .frame(maxWidth: .infinity)
                 }
                 FinderTagDots(tags: item.tags, size: 6)
-            }
-            .contextMenu {
-                FileItemContextMenu(item: item, controller: controller)
             }
         }
         .padding(.vertical, 7)
@@ -1499,6 +1467,7 @@ private struct BrowserListRow: View {
             primaryAction: { controller.selectItem(item.url, orderedURLs: orderedURLs) },
             doubleAction: { controller.openInBrowser(item.url) },
             dragEnded: controller.externalFileDragEnded,
+            contextMenu: { makeFileItemContextMenu(item: item, controller: controller) },
             isEnabled: !isRenaming
         ) {
             HStack(spacing: 12) {
@@ -1533,14 +1502,11 @@ private struct BrowserListRow: View {
                     .lineLimit(1)
                     .frame(width: dateWidth, alignment: .leading)
             }
-            .contextMenu {
-                FileItemContextMenu(item: item, controller: controller)
-            }
         }
         .padding(.leading, 20)
         .padding(.trailing, 12)
-        .frame(height: 32)
-        .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32, alignment: .leading)
+        .contentShape(Rectangle())
         .background(isSelected ? Color.accentColor.opacity(0.20) : .clear, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
         .overlay {
             if item.isDirectory && isFileDropTarget {
@@ -1585,41 +1551,196 @@ private struct BrowserListRow: View {
     }
 }
 
-private struct FileItemContextMenu: View {
-    let item: BrowserItem
-    @ObservedObject var controller: DockController
+private final class ClosureMenuItem: NSMenuItem {
+    private let handler: () -> Void
 
-    private var targets: [URL] { controller.selectedItemsOr(item.url) }
-    private var targetCount: Int { targets.count }
-    private var actionSuffix: String { targetCount == 1 ? "" : " (\(targetCount) Items)" }
-
-    var body: some View {
-        if item.isDirectory {
-            Button("Browse Here") { controller.openInBrowser(item.url) }
-        }
-        Button("Open\(actionSuffix)") { controller.openItems(targets) }
-        Button("Quick Look") {
-            controller.quickLook(targets)
-        }
-        Divider()
-        Button(targetCount == 1 ? "Rename…" : "Rename \(targetCount) Items…") {
-            controller.renameItems(targets)
-        }
-        Button("Duplicate\(actionSuffix)") { controller.duplicate(targets) }
-        Button("Copy\(actionSuffix)") { controller.copyToPasteboard(targets) }
-        Button("Cut\(actionSuffix)") { controller.cutItems(targets) }
-        Button("Copy Path\(actionSuffix)") { controller.copyPaths(targets) }
-        Button("Get Info") { controller.showInfo(for: item.url) }
-            .disabled(targetCount != 1)
-        FinderTagMenu(urls: targets, controller: controller)
-        Divider()
-        Button("Show in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting(targets)
-        }
-        Button("Move to Trash\(actionSuffix)", role: .destructive) {
-            controller.moveToTrash(targets)
+    init(
+        title: String,
+        symbolName: String? = nil,
+        isEnabled: Bool = true,
+        handler: @escaping () -> Void
+    ) {
+        self.handler = handler
+        super.init(title: title, action: #selector(runHandler), keyEquivalent: "")
+        target = self
+        self.isEnabled = isEnabled
+        if let symbolName {
+            image = menuSymbol(named: symbolName, description: title)
         }
     }
+
+    @available(*, unavailable)
+    required init(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func runHandler() {
+        handler()
+    }
+}
+
+private final class TagPaletteButton: NSButton {
+    weak var trackingMenu: NSMenu?
+    private let handler: () -> Void
+
+    init(tag: FinderTag, menu: NSMenu, handler: @escaping () -> Void) {
+        self.handler = handler
+        trackingMenu = menu
+        super.init(frame: .zero)
+        let dot = tag.menuImage
+        dot.size = NSSize(width: 14, height: 14)
+        image = dot
+        imageScaling = .scaleNone
+        isBordered = false
+        setButtonType(.momentaryChange)
+        toolTip = tag.name
+        target = self
+        action = #selector(runHandler)
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 20).isActive = true
+        heightAnchor.constraint(equalToConstant: 20).isActive = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func runHandler() {
+        trackingMenu?.cancelTracking()
+        handler()
+    }
+}
+
+private func menuSymbol(named name: String, description: String) -> NSImage? {
+    guard let image = NSImage(systemSymbolName: name, accessibilityDescription: description) else { return nil }
+    image.isTemplate = true
+    image.size = NSSize(width: 12, height: 12)
+    return image
+}
+
+@MainActor
+private func makeFileItemContextMenu(item: BrowserItem, controller: DockController) -> NSMenu {
+    if !controller.selectedItemURLs.contains(item.url) {
+        controller.selectOnly(item.url)
+    }
+
+    let targets = controller.selectedItemsOr(item.url)
+    let targetCount = targets.count
+    let actionSuffix = targetCount == 1 ? "" : " (\(targetCount) Items)"
+    let menu = NSMenu()
+    menu.autoenablesItems = false
+
+    func addAction(
+        _ title: String,
+        symbol: String,
+        isEnabled: Bool = true,
+        action: @escaping () -> Void
+    ) {
+        menu.addItem(ClosureMenuItem(
+            title: title,
+            symbolName: symbol,
+            isEnabled: isEnabled,
+            handler: action
+        ))
+    }
+
+    if item.isDirectory {
+        addAction("Browse Here", symbol: "folder") { controller.openInBrowser(item.url) }
+    }
+    addAction("Open\(actionSuffix)", symbol: "arrow.up.forward.app") { controller.openItems(targets) }
+    addAction("Quick Look", symbol: "eye") { controller.quickLook(targets) }
+    menu.addItem(.separator())
+    addAction("Move to Trash\(actionSuffix)", symbol: "trash") { controller.moveToTrash(targets) }
+    menu.addItem(.separator())
+    addAction("Get Info", symbol: "info.circle", isEnabled: targetCount == 1) {
+        controller.showInfo(for: item.url)
+    }
+    addAction(
+        targetCount == 1 ? "Rename…" : "Rename \(targetCount) Items…",
+        symbol: "pencil"
+    ) { controller.renameItems(targets) }
+    addAction("Duplicate\(actionSuffix)", symbol: "plus.square.on.square") { controller.duplicate(targets) }
+    addAction("Copy\(actionSuffix)", symbol: "doc.on.doc") { controller.copyToPasteboard(targets) }
+    addAction("Cut\(actionSuffix)", symbol: "scissors") { controller.cutItems(targets) }
+    addAction("Copy Path\(actionSuffix)", symbol: "link") { controller.copyPaths(targets) }
+    menu.addItem(.separator())
+    menu.addItem(makeTagPaletteMenuItem(menu: menu, targets: targets, controller: controller))
+    menu.addItem(makeTagsSubmenuItem(targets: targets, controller: controller))
+    menu.addItem(.separator())
+    addAction("Show in Finder", symbol: "scope") {
+        NSWorkspace.shared.activateFileViewerSelecting(targets)
+    }
+    return menu
+}
+
+@MainActor
+private func makeTagPaletteMenuItem(
+    menu: NSMenu,
+    targets: [URL],
+    controller: DockController
+) -> NSMenuItem {
+    let item = NSMenuItem()
+    item.isEnabled = true
+    let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 26))
+    let stack = NSStackView()
+    stack.orientation = .horizontal
+    stack.alignment = .centerY
+    stack.spacing = 4
+    stack.translatesAutoresizingMaskIntoConstraints = false
+
+    for tag in finderStandardTags {
+        let finderTag = FinderTag(name: tag.name, colorIndex: tag.colorIndex)
+        stack.addArrangedSubview(TagPaletteButton(tag: finderTag, menu: menu) {
+            controller.addFinderTag(name: tag.name, colorIndex: tag.colorIndex, to: targets)
+        })
+    }
+
+    container.addSubview(stack)
+    NSLayoutConstraint.activate([
+        stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 34),
+        stack.centerYAnchor.constraint(equalTo: container.centerYAnchor)
+    ])
+    item.view = container
+    return item
+}
+
+@MainActor
+private func makeTagsSubmenuItem(targets: [URL], controller: DockController) -> NSMenuItem {
+    let item = NSMenuItem(title: "Tags…", action: nil, keyEquivalent: "")
+    item.image = menuSymbol(named: "tag", description: "Tags")
+    let submenu = NSMenu(title: "Tags")
+    submenu.autoenablesItems = false
+
+    for tag in finderStandardTags {
+        let menuItem = ClosureMenuItem(title: tag.name) {
+            controller.addFinderTag(name: tag.name, colorIndex: tag.colorIndex, to: targets)
+        }
+        menuItem.image = FinderTag(name: tag.name, colorIndex: tag.colorIndex).menuImage
+        submenu.addItem(menuItem)
+    }
+
+    let existingTagNames = Array(Set(targets.flatMap { FinderTag.tags(for: $0).map(\.name) })).sorted()
+    if !existingTagNames.isEmpty {
+        submenu.addItem(.separator())
+        let removeItem = NSMenuItem(title: "Remove Tag", action: nil, keyEquivalent: "")
+        removeItem.image = menuSymbol(named: "tag.slash", description: "Remove Tag")
+        let removeMenu = NSMenu(title: "Remove Tag")
+        removeMenu.autoenablesItems = false
+        for name in existingTagNames {
+            removeMenu.addItem(ClosureMenuItem(title: name, symbolName: "tag.slash") {
+                controller.removeFinderTag(named: name, from: targets)
+            })
+        }
+        removeItem.submenu = removeMenu
+        submenu.addItem(removeItem)
+        submenu.addItem(ClosureMenuItem(title: "Clear Tags", symbolName: "xmark.circle") {
+            controller.clearFinderTags(from: targets)
+        })
+    }
+
+    item.submenu = submenu
+    return item
 }
 
 struct FileIcon: View {
