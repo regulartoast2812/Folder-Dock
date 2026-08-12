@@ -11,11 +11,18 @@ let package = Package(
         .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.2")
     ],
     targets: [
+        .target(name: "FolderDockCore"),
         .executableTarget(
             name: "FolderDock",
             dependencies: [
+                "FolderDockCore",
                 .product(name: "Sparkle", package: "Sparkle")
             ]
+        ),
+        .executableTarget(
+            name: "FolderDockGuardrails",
+            dependencies: ["FolderDockCore"],
+            path: "Tests/FolderDockGuardrails"
         )
     ]
 )

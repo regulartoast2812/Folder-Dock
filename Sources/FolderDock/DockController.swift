@@ -1,7 +1,95 @@
 import AppKit
+import Carbon.HIToolbox
 import Darwin
 import QuickLookUI
 import SwiftUI
+
+enum DockScreenAlignment: String, CaseIterable, Identifiable {
+    case left
+    case center
+    case right
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .left: "Top Left"
+        case .center: "Top Center"
+        case .right: "Top Right"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .left: "align.horizontal.left"
+        case .center: "align.horizontal.center"
+        case .right: "align.horizontal.right"
+        }
+    }
+}
+
+enum DockGlobalHotKey: String, CaseIterable, Identifiable {
+    case optionE
+    case shiftCommandE
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .optionE: "⌥E"
+        case .shiftCommandE: "⇧⌘E"
+        }
+    }
+
+    var carbonModifiers: UInt32 {
+        switch self {
+        case .optionE: UInt32(optionKey)
+        case .shiftCommandE: UInt32(shiftKey | cmdKey)
+        }
+    }
+}
+
+private let folderDockHotKeySignature: OSType = 0x46444F43 // FDOC
+
+private func optionOnlyFlags(_ flags: NSEvent.ModifierFlags) -> Bool {
+    let normalized = flags.intersection(.deviceIndependentFlagsMask)
+    return normalized.contains(.option)
+        && !normalized.contains(.command)
+        && !normalized.contains(.control)
+        && !normalized.contains(.shift)
+}
+
+private func folderDockHotKeyHandler(
+    _ nextHandler: EventHandlerCallRef?,
+    _ event: EventRef?,
+    _ userData: UnsafeMutableRawPointer?
+) -> OSStatus {
+    guard let event, let userData else { return OSStatus(eventNotHandledErr) }
+    var hotKeyID = EventHotKeyID()
+    let parameterStatus = GetEventParameter(
+        event,
+        EventParamName(kEventParamDirectObject),
+        EventParamType(typeEventHotKeyID),
+        nil,
+        MemoryLayout<EventHotKeyID>.size,
+        nil,
+        &hotKeyID
+    )
+    guard parameterStatus == noErr,
+          hotKeyID.signature == folderDockHotKeySignature else {
+        return OSStatus(eventNotHandledErr)
+    }
+    let controller = Unmanaged<DockController>.fromOpaque(userData).takeUnretainedValue()
+    MainActor.assumeIsolated {
+        switch hotKeyID.id {
+        case 1: controller.toggleFromMenuBar()
+        case 2: controller.switchSetFromHotKey(forward: false)
+        case 3: controller.switchSetFromHotKey(forward: true)
+        default: break
+        }
+    }
+    return noErr
+}
 
 enum DockPrompt: Identifiable {
     case newFolder(parent: URL)
@@ -65,6 +153,13 @@ private struct FileUndoEntry {
     let operation: FileUndoOperation
 }
 
+private enum DockPresentationMode: Equatable {
+    case hidden
+    case hover
+    case interacted
+    case explicit
+}
+
 private final class DroppedURLCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var urls: [URL] = []
@@ -84,21 +179,36 @@ private final class DroppedURLCollector: @unchecked Sendable {
 
 @MainActor
 final class DockController: ObservableObject {
+    private static let screenAlignmentDefaultsKey = "dockScreenAlignment"
+    private static let revealZoneWidthDefaultsKey = "dockRevealZoneWidth"
+    private static let edgeHoverEnabledDefaultsKey = "dockEdgeHoverEnabled"
+    private static let globalHotKeyEnabledDefaultsKey = "dockGlobalHotKeyEnabled"
+    private static let globalHotKeyDefaultsKey = "dockGlobalHotKey"
+    private static let setHotKeysEnabledDefaultsKey = "dockSetHotKeysEnabled"
+    private static let activationDefaultsVersionKey = "dockActivationDefaultsVersion"
     private let store: FolderStore
     let updateController: UpdateController
     private var shelfPanel: DockPanel?
     private var browserPanel: DockPanel?
     private var hoverTimer: Timer?
+    private var hotKeyEventHandler: EventHandlerRef?
+    private var registeredActivationHotKey: EventHotKeyRef?
+    private var registeredPreviousSetHotKey: EventHotKeyRef?
+    private var activationHotKeyRegistrationError: String?
+    private var setHotKeyRegistrationError: String?
     private var dismissalWorkItem: DispatchWorkItem?
     private var shortcutEventMonitor: Any?
     private var globalMouseShortcutMonitor: Any?
+    private var globalOutsideClickMonitor: Any?
     private let quickLookController = QuickLookPreviewController()
     private var hasStarted = false
-    private var isInteractionLocked = false
+    private var presentationMode: DockPresentationMode = .hidden
+    private var lastObservedPointerLocation: NSPoint?
     private var shelfResizeBaseWidth: CGFloat?
     private var shelfResizeStartMouseX: CGFloat?
     private var browserResizeBaseSize: NSSize?
     private var browserResizeStartMouse: NSPoint?
+    private var presentationScreen: NSScreen?
     private var fileUndoStack: [FileUndoEntry] = []
     private var navigationHistory: [URL] = []
     private var historyIndex = -1
@@ -120,6 +230,54 @@ final class DockController: ObservableObject {
     @Published var batchRenameFormatName = "File"
     @Published var batchRenameStartIndex = 1
     @Published private(set) var batchRenameError: String?
+    @Published var screenAlignment: DockScreenAlignment {
+        didSet {
+            guard screenAlignment != oldValue else { return }
+            UserDefaults.standard.set(screenAlignment.rawValue, forKey: Self.screenAlignmentDefaultsKey)
+            repositionVisiblePanels()
+        }
+    }
+    @Published var revealZoneWidth: Double {
+        didSet {
+            UserDefaults.standard.set(revealZoneWidth, forKey: Self.revealZoneWidthDefaultsKey)
+        }
+    }
+    @Published var edgeHoverEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(edgeHoverEnabled, forKey: Self.edgeHoverEnabledDefaultsKey)
+            if !edgeHoverEnabled {
+                cancelDismissal()
+            }
+        }
+    }
+    @Published var globalHotKeyEnabled: Bool {
+        didSet {
+            guard globalHotKeyEnabled != oldValue else { return }
+            UserDefaults.standard.set(globalHotKeyEnabled, forKey: Self.globalHotKeyEnabledDefaultsKey)
+            updateGlobalHotKeyRegistration()
+        }
+    }
+    @Published var globalHotKey: DockGlobalHotKey {
+        didSet {
+            guard globalHotKey != oldValue else { return }
+            UserDefaults.standard.set(globalHotKey.rawValue, forKey: Self.globalHotKeyDefaultsKey)
+            updateGlobalHotKeyRegistration()
+        }
+    }
+    @Published private(set) var globalHotKeyError: String?
+    @Published var setHotKeysEnabled: Bool {
+        didSet {
+            guard setHotKeysEnabled != oldValue else { return }
+            UserDefaults.standard.set(setHotKeysEnabled, forKey: Self.setHotKeysEnabledDefaultsKey)
+            if hasVisiblePanel {
+                updateSetHotKeyRegistration()
+            } else {
+                unregisterSetHotKeys()
+                setHotKeyError = nil
+            }
+        }
+    }
+    @Published private(set) var setHotKeyError: String?
     private var batchRenameReferenceDate = Date()
 
     var canGoBack: Bool { historyIndex > 0 }
@@ -130,6 +288,51 @@ final class DockController: ObservableObject {
     init(store: FolderStore, updateController: UpdateController) {
         self.store = store
         self.updateController = updateController
+        let defaults = UserDefaults.standard
+        screenAlignment = DockScreenAlignment(
+            rawValue: UserDefaults.standard.string(forKey: Self.screenAlignmentDefaultsKey) ?? ""
+        ) ?? .center
+        let savedRevealWidth = defaults.double(forKey: Self.revealZoneWidthDefaultsKey)
+        revealZoneWidth = savedRevealWidth > 0 ? min(max(savedRevealWidth, 80), 600) : 220
+        if defaults.integer(forKey: Self.activationDefaultsVersionKey) < 2 {
+            edgeHoverEnabled = true
+            globalHotKeyEnabled = true
+            globalHotKey = .optionE
+            setHotKeysEnabled = true
+            defaults.set(true, forKey: Self.edgeHoverEnabledDefaultsKey)
+            defaults.set(true, forKey: Self.globalHotKeyEnabledDefaultsKey)
+            defaults.set(DockGlobalHotKey.optionE.rawValue, forKey: Self.globalHotKeyDefaultsKey)
+            defaults.set(true, forKey: Self.setHotKeysEnabledDefaultsKey)
+            defaults.set(2, forKey: Self.activationDefaultsVersionKey)
+        } else {
+            edgeHoverEnabled = defaults.object(forKey: Self.edgeHoverEnabledDefaultsKey) as? Bool ?? true
+            globalHotKeyEnabled = defaults.object(forKey: Self.globalHotKeyEnabledDefaultsKey) as? Bool ?? true
+            globalHotKey = DockGlobalHotKey(
+                rawValue: defaults.string(forKey: Self.globalHotKeyDefaultsKey) ?? ""
+            ) ?? .optionE
+            setHotKeysEnabled = defaults.object(forKey: Self.setHotKeysEnabledDefaultsKey) as? Bool ?? true
+        }
+        if defaults.integer(forKey: Self.activationDefaultsVersionKey) < 3 {
+            globalHotKey = .optionE
+            defaults.set(DockGlobalHotKey.optionE.rawValue, forKey: Self.globalHotKeyDefaultsKey)
+            defaults.set(3, forKey: Self.activationDefaultsVersionKey)
+        }
+        if defaults.integer(forKey: Self.activationDefaultsVersionKey) < 4 {
+            globalHotKeyEnabled = false
+            setHotKeysEnabled = false
+            defaults.set(false, forKey: Self.globalHotKeyEnabledDefaultsKey)
+            defaults.set(false, forKey: Self.setHotKeysEnabledDefaultsKey)
+            defaults.set(4, forKey: Self.activationDefaultsVersionKey)
+        }
+        if defaults.integer(forKey: Self.activationDefaultsVersionKey) < 5 {
+            globalHotKey = .optionE
+            globalHotKeyEnabled = true
+            setHotKeysEnabled = false
+            defaults.set(DockGlobalHotKey.optionE.rawValue, forKey: Self.globalHotKeyDefaultsKey)
+            defaults.set(true, forKey: Self.globalHotKeyEnabledDefaultsKey)
+            defaults.set(false, forKey: Self.setHotKeysEnabledDefaultsKey)
+            defaults.set(5, forKey: Self.activationDefaultsVersionKey)
+        }
     }
 
     func start() {
@@ -151,6 +354,7 @@ final class DockController: ObservableObject {
         if let hoverTimer {
             RunLoop.main.add(hoverTimer, forMode: .common)
         }
+        updateGlobalHotKeyRegistration()
 
         shortcutEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .otherMouseDown]) { [weak self] event in
             guard let self else { return event }
@@ -161,10 +365,18 @@ final class DockController: ObservableObject {
                 self?.handleGlobalMouseShortcut(event)
             }
         }
+        globalOutsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleExternalApplicationClick()
+            }
+        }
     }
 
     func show() {
         cancelDismissal()
+        if !hasVisiblePanel {
+            presentationScreen = screen(containing: NSEvent.mouseLocation) ?? presentationScreen
+        }
         let shelf = makeShelfPanelIfNeeded()
         positionShelf(shelf)
         shelf.orderFrontRegardless()
@@ -173,11 +385,139 @@ final class DockController: ObservableObject {
             positionBrowser(browser, below: shelf)
             browser.orderFrontRegardless()
         }
+        registerSetHotKeysAfterPresentation()
+        if presentationMode == .explicit {
+            scheduleDismissal(after: 5, for: .explicit, resetting: true)
+        }
     }
+
+    func toggleFromMenuBar() {
+        if hasVisiblePanel {
+            hide()
+        } else {
+            presentationMode = .explicit
+            show()
+        }
+    }
+
+    func handleApplicationDeactivation() {
+        if presentationMode == .explicit {
+            hide()
+        }
+    }
+
+    private func handleExternalApplicationClick() {
+        guard presentationMode == .explicit else { return }
+        hide()
+    }
+
+    private func updateGlobalHotKeyRegistration() {
+        if let registeredActivationHotKey {
+            UnregisterEventHotKey(registeredActivationHotKey)
+            self.registeredActivationHotKey = nil
+        }
+        activationHotKeyRegistrationError = nil
+        refreshGlobalHotKeyError()
+        guard hasStarted, globalHotKeyEnabled else { return }
+
+        guard ensureHotKeyEventHandler() else {
+            activationHotKeyRegistrationError = "Folder Dock couldn't listen for the selected shortcut."
+            refreshGlobalHotKeyError()
+            return
+        }
+
+        var activationHotKey: EventHotKeyRef?
+        let identifier = EventHotKeyID(signature: folderDockHotKeySignature, id: 1)
+        let status = RegisterEventHotKey(
+            UInt32(kVK_ANSI_E),
+            globalHotKey.carbonModifiers,
+            identifier,
+            GetApplicationEventTarget(),
+            0,
+            &activationHotKey
+        )
+        if status == noErr, let activationHotKey {
+            registeredActivationHotKey = activationHotKey
+        } else {
+            activationHotKeyRegistrationError = "\(globalHotKey.title) is already reserved by macOS or another app."
+        }
+        refreshGlobalHotKeyError()
+        if hasVisiblePanel { updateSetHotKeyRegistration() }
+    }
+
+    private func updateSetHotKeyRegistration() {
+        unregisterSetHotKeys()
+        setHotKeyRegistrationError = nil
+        setHotKeyError = nil
+        guard hasStarted, setHotKeysEnabled else { return }
+        guard ensureHotKeyEventHandler() else {
+            setHotKeyRegistrationError = "Folder Dock couldn't listen for the previous-set shortcut."
+            setHotKeyError = setHotKeyRegistrationError
+            return
+        }
+        var previousHotKey: EventHotKeyRef?
+        let status = RegisterEventHotKey(
+            UInt32(kVK_ANSI_Q),
+            UInt32(optionKey),
+            EventHotKeyID(signature: folderDockHotKeySignature, id: 2),
+            GetApplicationEventTarget(),
+            UInt32(kEventHotKeyExclusive),
+            &previousHotKey
+        )
+        if status == noErr, let previousHotKey {
+            registeredPreviousSetHotKey = previousHotKey
+        } else {
+            setHotKeyRegistrationError = "⌥Q is reserved by macOS or another app."
+        }
+        setHotKeyError = setHotKeyRegistrationError
+    }
+
+    private func registerSetHotKeysAfterPresentation() {
+        // When show() itself was triggered by a Carbon hotkey, registering more
+        // Carbon hotkeys inside that same callback reports success but the new
+        // registrations may not receive events. Defer one main-loop turn so the
+        // activation event finishes and the shelf is visibly ordered first.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.hasVisiblePanel else { return }
+            self.updateSetHotKeyRegistration()
+        }
+    }
+
+    private func unregisterSetHotKeys() {
+        if let registeredPreviousSetHotKey {
+            UnregisterEventHotKey(registeredPreviousSetHotKey)
+            self.registeredPreviousSetHotKey = nil
+        }
+    }
+
+    private func ensureHotKeyEventHandler() -> Bool {
+        if hotKeyEventHandler != nil { return true }
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        return InstallEventHandler(
+            GetApplicationEventTarget(),
+            folderDockHotKeyHandler,
+            1,
+            &eventType,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &hotKeyEventHandler
+        ) == noErr
+    }
+
+    private func refreshGlobalHotKeyError() {
+        globalHotKeyError = activationHotKeyRegistrationError
+    }
+
+    var isVisible: Bool { hasVisiblePanel }
 
     func hide() {
         cancelDismissal()
-        isInteractionLocked = false
+        presentationMode = .hidden
+        unregisterSetHotKeys()
+        setHotKeyRegistrationError = nil
+        setHotKeyError = nil
         shelfPanel?.orderOut(nil)
         browserPanel?.orderOut(nil)
     }
@@ -191,8 +531,12 @@ final class DockController: ObservableObject {
     }
 
     func keepOpen() {
-        isInteractionLocked = true
-        cancelDismissal()
+        if presentationMode == .explicit {
+            scheduleDismissal(after: 5, for: .explicit, resetting: true)
+        } else {
+            presentationMode = .interacted
+            cancelDismissal()
+        }
     }
 
     func beginShelfResize() {
@@ -207,7 +551,8 @@ final class DockController: ObservableObject {
         let baseWidth = shelfResizeBaseWidth ?? panel.frame.width
         let mouseDelta = NSEvent.mouseLocation.x - startMouseX
         let directionalTranslation = fromLeadingEdge ? -mouseDelta : mouseDelta
-        panel.setContentSize(NSSize(width: max(360, baseWidth + directionalTranslation * 2), height: 100))
+        let scaleFactor: CGFloat = screenAlignment == .center ? 2 : 1
+        panel.setContentSize(NSSize(width: max(360, baseWidth + directionalTranslation * scaleFactor), height: 100))
         positionShelf(panel)
         if let browser = browserPanel, browser.isVisible {
             positionBrowser(browser, below: panel)
@@ -237,8 +582,9 @@ final class DockController: ObservableObject {
         let mouseDeltaX = NSEvent.mouseLocation.x - startMouse.x
         let directionalTranslation = fromLeadingEdge ? -mouseDeltaX : mouseDeltaX
         let downwardMouseDelta = startMouse.y - NSEvent.mouseLocation.y
+        let scaleFactor: CGFloat = screenAlignment == .center ? 2 : 1
         panel.setContentSize(NSSize(
-            width: max(520, baseSize.width + directionalTranslation * 2),
+            width: max(520, baseSize.width + directionalTranslation * scaleFactor),
             height: max(300, baseSize.height + downwardMouseDelta)
         ))
         positionBrowser(panel, below: shelf)
@@ -256,9 +602,9 @@ final class DockController: ObservableObject {
     func chooseFolders() {
         keepOpen()
         let picker = NSOpenPanel()
-        picker.title = "Save folders to Folder Dock"
-        picker.prompt = "Save Folders"
-        picker.canChooseFiles = false
+        picker.title = "Save files or folders to Folder Dock"
+        picker.prompt = "Save Items"
+        picker.canChooseFiles = true
         picker.canChooseDirectories = true
         picker.allowsMultipleSelection = true
         picker.canCreateDirectories = false
@@ -271,9 +617,21 @@ final class DockController: ObservableObject {
     }
 
     func selectSet(_ set: FolderSet) {
+        guard set.id != store.selectedSetID else {
+            keepOpen()
+            return
+        }
+        let wasBrowsing = currentFolder != nil || isManagingSets
+        if wasBrowsing {
+            navigationHistory.removeAll(keepingCapacity: true)
+            historyIndex = -1
+            currentFolder = nil
+            isManagingSets = false
+            clearSelection()
+            browserPanel?.orderOut(nil)
+        }
         store.selectSet(set)
         keepOpen()
-        closeBrowser()
     }
 
     func switchSet(forward: Bool) {
@@ -286,7 +644,17 @@ final class DockController: ObservableObject {
         selectSet(sets[nextIndex])
     }
 
+    func switchSetFromHotKey(forward: Bool) {
+        guard hasVisiblePanel else { return }
+        switchSet(forward: forward)
+    }
+
     func browse(_ folder: SavedFolder) {
+        guard folder.isDirectory else {
+            NSWorkspace.shared.open(folder.url)
+            keepOpen()
+            return
+        }
         isManagingSets = false
         navigationHistory = [folder.url]
         historyIndex = 0
@@ -1139,7 +1507,9 @@ final class DockController: ObservableObject {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.hidesOnDeactivate = false
-        panel.becomesKeyOnlyIfNeeded = true
+        // Keep passive hover non-activating, but allow a click on the dock to
+        // establish keyboard focus so visible-only shortcuts work reliably.
+        panel.becomesKeyOnlyIfNeeded = false
         panel.isMovable = false
         panel.isMovableByWindowBackground = false
         panel.fixedContentHeight = fixedHeight
@@ -1160,21 +1530,48 @@ final class DockController: ObservableObject {
 
     private func checkPointerPosition() {
         let location = NSEvent.mouseLocation
+        if let lastObservedPointerLocation, lastObservedPointerLocation != location {
+            if presentationMode == .explicit {
+                scheduleDismissal(after: 5, for: .explicit, resetting: true)
+            }
+        }
+        lastObservedPointerLocation = location
+
+        if presentationMode == .explicit {
+            return
+        }
         guard let screen = screen(containing: location) else { return }
 
-        let inHotZone = abs(location.x - screen.frame.midX) < 210
-            && screen.frame.maxY - location.y < 24
+        let isAtTopEdge = screen.frame.maxY - location.y < 24
+        let revealWidth = CGFloat(revealZoneWidth)
+        let inHorizontalHotZone: Bool
+        switch screenAlignment {
+        case .left:
+            inHorizontalHotZone = location.x < screen.frame.minX + revealWidth
+        case .center:
+            inHorizontalHotZone = abs(location.x - screen.frame.midX) < revealWidth / 2
+        case .right:
+            inHorizontalHotZone = location.x > screen.frame.maxX - revealWidth
+        }
+        let inHotZone = isAtTopEdge && inHorizontalHotZone
 
-        if isInteractionLocked {
-            cancelDismissal()
-        } else if inHotZone {
+        if presentationMode == .interacted {
+            if pointerIsInsideVisiblePanel(location) {
+                cancelDismissal()
+            } else {
+                scheduleDismissal(after: 3, for: .interacted)
+            }
+        } else if edgeHoverEnabled && inHotZone {
             if hasVisiblePanel {
                 cancelDismissal()
             } else {
+                presentationScreen = screen
+                presentationMode = .hover
                 show()
             }
-        } else if hasVisiblePanel && !pointerIsInsideVisiblePanel(location) {
-            scheduleDismissal()
+        } else if presentationMode == .hover,
+                  hasVisiblePanel && !pointerIsInsideVisiblePanel(location) {
+            scheduleDismissal(after: 0.45, for: .hover)
         } else {
             cancelDismissal()
         }
@@ -1194,13 +1591,13 @@ final class DockController: ObservableObject {
     }
 
     private func positionShelf(_ panel: NSPanel) {
-        let mouseLocation = NSEvent.mouseLocation
-        guard let screen = screen(containing: mouseLocation) else { return }
+        let screen = presentationScreen ?? screen(containing: NSEvent.mouseLocation) ?? NSScreen.main
+        guard let screen else { return }
         let maximumWidth = max(360, screen.visibleFrame.width - 24)
         if panel.frame.width > maximumWidth {
             panel.setContentSize(NSSize(width: maximumWidth, height: 100))
         }
-        let x = screen.frame.midX - panel.frame.width / 2
+        let x = alignedOriginX(for: panel.frame.width, on: screen)
         let y = screen.visibleFrame.maxY - panel.frame.height - 4
         panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
@@ -1216,20 +1613,45 @@ final class DockController: ObservableObject {
         if size != panel.frame.size {
             panel.setContentSize(size)
         }
-        let x = screen.frame.midX - panel.frame.width / 2
+        let x = alignedOriginX(for: panel.frame.width, on: screen)
         let y = shelf.frame.minY - panel.frame.height - 8
         panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
 
-    private func scheduleDismissal() {
-        guard dismissalWorkItem == nil else { return }
+    private func alignedOriginX(for width: CGFloat, on screen: NSScreen) -> CGFloat {
+        switch screenAlignment {
+        case .left:
+            screen.visibleFrame.minX + 12
+        case .center:
+            screen.visibleFrame.midX - width / 2
+        case .right:
+            screen.visibleFrame.maxX - width - 12
+        }
+    }
+
+    private func repositionVisiblePanels() {
+        guard let shelf = shelfPanel else { return }
+        presentationScreen = shelf.screen ?? presentationScreen ?? screen(containing: NSEvent.mouseLocation)
+        positionShelf(shelf)
+        if let browser = browserPanel, browser.isVisible {
+            positionBrowser(browser, below: shelf)
+        }
+    }
+
+    private func scheduleDismissal(
+        after delay: TimeInterval,
+        for expectedMode: DockPresentationMode,
+        resetting: Bool = false
+    ) {
+        if dismissalWorkItem != nil, !resetting { return }
+        cancelDismissal()
         let work = DispatchWorkItem { [weak self] in
-            self?.shelfPanel?.orderOut(nil)
-            self?.browserPanel?.orderOut(nil)
-            self?.dismissalWorkItem = nil
+            guard let self, self.presentationMode == expectedMode else { return }
+            self.dismissalWorkItem = nil
+            self.hide()
         }
         dismissalWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func cancelDismissal() {
@@ -1339,6 +1761,9 @@ final class DockController: ObservableObject {
     }
 
     private func handleShortcutEvent(_ event: NSEvent) -> NSEvent? {
+        if presentationMode == .explicit {
+            scheduleDismissal(after: 5, for: .explicit, resetting: true)
+        }
         if event.type == .otherMouseDown {
             return handleMouseShortcut(event) ? nil : event
         }

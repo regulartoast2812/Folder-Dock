@@ -9,6 +9,7 @@ framework_source="${binary_dir}/Sparkle.framework"
 
 cd "$project_dir"
 swift build -c release
+"${binary_dir}/FolderDockGuardrails"
 
 rm -rf "$output_dir"
 mkdir -p "$output_dir/Contents/MacOS" "$output_dir/Contents/Resources" "$output_dir/Contents/Frameworks"

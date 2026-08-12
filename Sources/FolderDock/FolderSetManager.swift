@@ -13,7 +13,7 @@ struct FolderSetManager: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Folder Sets")
                         .font(.system(size: 15, weight: .semibold))
-                    Text("Keep shared assets and each project’s folders separate.")
+                    Text("Keep shared files, folders, and each project’s items separate.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }
@@ -54,7 +54,7 @@ struct FolderSetManager: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(set.name)
                                     .font(.system(size: 13, weight: .medium))
-                                Text("\(set.folders.count) saved folder\(set.folders.count == 1 ? "" : "s")")
+                                Text("\(set.folders.count) saved item\(set.folders.count == 1 ? "" : "s")")
                                     .font(.system(size: 10))
                                     .foregroundStyle(.secondary)
                             }

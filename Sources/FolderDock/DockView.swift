@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import FolderDockCore
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -12,13 +13,40 @@ private let compactBrowserDateFormatter: DateFormatter = {
     return formatter
 }()
 
+private struct ShelfItemFramesPreferenceKey: PreferenceKey {
+    static let defaultValue: [UUID: CGRect] = [:]
+
+    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private struct ShelfViewportWidthPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 struct DockView: View {
     @ObservedObject var store: FolderStore
     @ObservedObject var controller: DockController
     @ObservedObject var updateController: UpdateController
     @State private var isTargeted = false
     @State private var draggedSetID: UUID?
-    @State private var draggedFolderID: UUID?
+    @State private var selectedShelfItemIDs = Set<UUID>()
+    @State private var shelfSelectionAnchorID: UUID?
+    @State private var draggedShelfItemIDs: [UUID] = []
+    @State private var shelfItemFrames: [UUID: CGRect] = [:]
+    @State private var shelfMarqueeStart: CGPoint?
+    @State private var shelfMarqueeCurrent: CGPoint?
+    @State private var shelfMarqueeBaseSelection = Set<UUID>()
+    @State private var shelfMarqueeAccumulatedIDs = Set<UUID>()
+    @State private var isShelfMarqueeAllowed: Bool?
+    @State private var shelfViewportWidth: CGFloat = 0
+    @State private var shelfAutoScrollDirection: ShelfAutoScrollDirection?
+    @State private var shelfAutoScrollTask: Task<Void, Never>?
     @State private var editingSetID: UUID?
     @State private var editingSetName = ""
 
@@ -99,6 +127,15 @@ struct DockView: View {
                     .buttonStyle(.plain)
                     .help("Manage folder sets")
 
+                    SettingsLink {
+                        Image(systemName: "gearshape")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 25, height: 25)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Folder Dock settings")
+
                     Button(action: controller.hide) {
                         Image(systemName: "xmark")
                             .font(.system(size: 11, weight: .bold))
@@ -118,40 +155,81 @@ struct DockView: View {
             Divider()
 
             HStack(spacing: 12) {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        if store.folders.isEmpty {
-                            emptyState
-                        } else {
-                            ForEach(store.folders) { folder in
-                                FolderTile(
+                ScrollViewReader { scrollProxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            if store.folders.isEmpty {
+                                emptyState
+                            } else {
+                                ForEach(store.folders) { folder in
+                                    FolderTile(
                                     folder: folder,
+                                    isSelected: selectedShelfItemIDs.contains(folder.id),
                                     store: store,
                                     controller: controller,
-                                    onStartDrag: { draggedFolderID = folder.id },
+                                    primaryAction: { selectShelfItem(folder) },
+                                    actionItems: { shelfActionItems(for: folder) },
+                                    onContextMenu: { prepareShelfContextMenu(for: folder) },
+                                    onStartDrag: { beginShelfDrag(from: folder) },
+                                    onEndDrag: { draggedShelfItemIDs = [] },
                                     onReceiveDrop: { urls in
-                                        if let draggedFolderID {
-                                            store.moveFolder(draggedFolderID, before: folder.id)
-                                            self.draggedFolderID = nil
+                                        if !draggedShelfItemIDs.isEmpty {
+                                            guard !draggedShelfItemIDs.contains(folder.id) else { return false }
+                                            store.moveFolders(draggedShelfItemIDs, before: folder.id)
+                                            self.draggedShelfItemIDs = []
                                             return true
                                         }
+                                        guard folder.isDirectory else { return false }
                                         controller.receiveURLs(urls, into: folder.url)
                                         return !urls.isEmpty
                                     }
-                                )
+                                    )
+                                    .id(folder.id)
+                                }
                             }
-                        }
 
-                        Button(action: controller.chooseFolders) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 13, weight: .semibold))
-                                .frame(width: 29, height: 29)
-                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            Button(action: controller.chooseFolders) {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .frame(width: 29, height: 29)
+                                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            .help("Save files or folders to \(store.selectedSet?.name ?? "this set")")
                         }
-                        .buttonStyle(.plain)
-                        .help("Save folders to \(store.selectedSet?.name ?? "this set")")
+                        .padding(.vertical, 3)
                     }
-                    .padding(.vertical, 3)
+                    .coordinateSpace(name: "savedShelf")
+                    .contentShape(Rectangle())
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: ShelfViewportWidthPreferenceKey.self,
+                                value: proxy.size.width
+                            )
+                        }
+                    }
+                    .onPreferenceChange(ShelfViewportWidthPreferenceKey.self) { shelfViewportWidth = $0 }
+                    .onPreferenceChange(ShelfItemFramesPreferenceKey.self) { frames in
+                        shelfItemFrames = frames
+                        updateShelfSelectionForCurrentMarquee()
+                    }
+                    .simultaneousGesture(shelfMarqueeGesture(using: scrollProxy))
+                    .simultaneousGesture(shelfBlankTapGesture)
+                    .overlay(alignment: .topLeading) {
+                        if let marqueeRect = shelfMarqueeRect {
+                            Rectangle()
+                                .fill(Color.accentColor.opacity(0.14))
+                                .overlay {
+                                    Rectangle()
+                                        .stroke(Color.accentColor.opacity(0.85), lineWidth: 1)
+                                }
+                                .frame(width: marqueeRect.width, height: marqueeRect.height)
+                                .offset(x: marqueeRect.minX, y: marqueeRect.minY)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .onDisappear(perform: stopShelfAutoScroll)
                 }
             }
             .padding(.horizontal, 12)
@@ -182,6 +260,16 @@ struct DockView: View {
             }
         }
         .onDrop(of: [.fileURL], isTargeted: $isTargeted, perform: acceptDrop(providers:))
+        .onChange(of: store.selectedSetID) { _, _ in
+            clearShelfSelection()
+        }
+        .onChange(of: store.folders.map(\.id)) { _, itemIDs in
+            let validIDs = Set(itemIDs)
+            selectedShelfItemIDs.formIntersection(validIDs)
+            if let shelfSelectionAnchorID, !validIDs.contains(shelfSelectionAnchorID) {
+                self.shelfSelectionAnchorID = selectedShelfItemIDs.first
+            }
+        }
     }
 
     private var buildNumber: String {
@@ -197,7 +285,7 @@ struct DockView: View {
 
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Drag a folder from Finder here")
+            Text("Drag files or folders here")
                 .font(.system(size: 13, weight: .medium))
             Text("or choose one with +")
                 .font(.system(size: 10))
@@ -223,6 +311,224 @@ struct DockView: View {
             }
         }
         return !providers.isEmpty
+    }
+
+    private func selectShelfItem(_ item: SavedFolder) {
+        let modifiers = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let orderedIDs = store.folders.map(\.id)
+
+        if modifiers.contains(.shift),
+           let anchor = shelfSelectionAnchorID,
+           let anchorIndex = orderedIDs.firstIndex(of: anchor),
+           let itemIndex = orderedIDs.firstIndex(of: item.id) {
+            let range = min(anchorIndex, itemIndex)...max(anchorIndex, itemIndex)
+            let rangeIDs = Set(orderedIDs[range])
+            if modifiers.contains(.command) {
+                selectedShelfItemIDs.formUnion(rangeIDs)
+            } else {
+                selectedShelfItemIDs = rangeIDs
+            }
+            controller.keepOpen()
+            return
+        }
+
+        if modifiers.contains(.command) {
+            if selectedShelfItemIDs.contains(item.id) {
+                selectedShelfItemIDs.remove(item.id)
+            } else {
+                selectedShelfItemIDs.insert(item.id)
+            }
+            shelfSelectionAnchorID = item.id
+            controller.keepOpen()
+            return
+        }
+
+        selectedShelfItemIDs = [item.id]
+        shelfSelectionAnchorID = item.id
+        controller.keepOpen()
+    }
+
+    private func shelfActionItems(for item: SavedFolder) -> [SavedFolder] {
+        ShelfActionTargetResolver.resolve(
+            clickedItem: item,
+            selectedIDs: selectedShelfItemIDs,
+            orderedItems: store.folders,
+            id: \.id
+        )
+    }
+
+    private func prepareShelfContextMenu(for item: SavedFolder) {
+        if !selectedShelfItemIDs.contains(item.id) {
+            selectedShelfItemIDs = [item.id]
+            shelfSelectionAnchorID = item.id
+        }
+        controller.keepOpen()
+    }
+
+    private func beginShelfDrag(from item: SavedFolder) {
+        if !selectedShelfItemIDs.contains(item.id) {
+            selectedShelfItemIDs = [item.id]
+            shelfSelectionAnchorID = item.id
+        }
+        draggedShelfItemIDs = store.folders
+            .filter { selectedShelfItemIDs.contains($0.id) }
+            .map(\.id)
+        controller.keepOpen()
+    }
+
+    private func clearShelfSelection() {
+        selectedShelfItemIDs.removeAll()
+        shelfSelectionAnchorID = nil
+        draggedShelfItemIDs = []
+        endShelfMarquee()
+    }
+
+    private func shelfMarqueeGesture(using scrollProxy: ScrollViewProxy) -> some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .named("savedShelf"))
+            .onChanged { value in updateShelfMarquee(value, using: scrollProxy) }
+            .onEnded { _ in
+                if isShelfMarqueeAllowed == true {
+                    shelfSelectionAnchorID = store.folders.last(where: {
+                        selectedShelfItemIDs.contains($0.id)
+                    })?.id
+                    controller.keepOpen()
+                }
+                endShelfMarquee()
+            }
+    }
+
+    private var shelfBlankTapGesture: some Gesture {
+        SpatialTapGesture(coordinateSpace: .named("savedShelf"))
+            .onEnded { value in
+                let tappedItem = shelfItemFrames.values.contains { frame in
+                    frame.insetBy(dx: -2, dy: -2).contains(value.location)
+                }
+                guard !tappedItem else { return }
+                clearShelfSelection()
+                controller.keepOpen()
+            }
+    }
+
+    private var shelfMarqueeRect: CGRect? {
+        guard isShelfMarqueeAllowed == true,
+              let start = shelfMarqueeStart,
+              let current = shelfMarqueeCurrent else { return nil }
+        return selectionRect(from: start, to: current)
+    }
+
+    private func updateShelfMarquee(_ value: DragGesture.Value, using scrollProxy: ScrollViewProxy) {
+        if isShelfMarqueeAllowed == nil {
+            let startedOnItem = shelfItemFrames.values.contains { frame in
+                frame.insetBy(dx: -2, dy: -2).contains(value.startLocation)
+            }
+            isShelfMarqueeAllowed = !startedOnItem
+            guard !startedOnItem else { return }
+
+            shelfMarqueeStart = value.startLocation
+            shelfMarqueeAccumulatedIDs = []
+            let modifiers = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            shelfMarqueeBaseSelection = modifiers.contains(.command) ? selectedShelfItemIDs : []
+        }
+
+        guard isShelfMarqueeAllowed == true, shelfMarqueeStart != nil else { return }
+        shelfMarqueeCurrent = value.location
+        updateShelfSelectionForCurrentMarquee()
+        updateShelfAutoScroll(for: value.location.x, using: scrollProxy)
+        controller.keepOpen()
+    }
+
+    private func updateShelfSelectionForCurrentMarquee() {
+        guard isShelfMarqueeAllowed == true,
+              let start = shelfMarqueeStart,
+              let current = shelfMarqueeCurrent else { return }
+        let marquee = selectionRect(from: start, to: current)
+        let intersectingIDs = Set(shelfItemFrames.compactMap { id, frame in
+            marquee.intersects(frame) ? id : nil
+        })
+        if shelfAutoScrollDirection != nil {
+            shelfMarqueeAccumulatedIDs.formUnion(intersectingIDs)
+        }
+        selectedShelfItemIDs = shelfMarqueeBaseSelection
+            .union(shelfMarqueeAccumulatedIDs)
+            .union(intersectingIDs)
+    }
+
+    private func updateShelfAutoScroll(for pointerX: CGFloat, using scrollProxy: ScrollViewProxy) {
+        let edgeThreshold: CGFloat = 26
+        let direction: ShelfAutoScrollDirection?
+        if pointerX <= edgeThreshold {
+            direction = .backward
+        } else if shelfViewportWidth > 0 && pointerX >= shelfViewportWidth - edgeThreshold {
+            direction = .forward
+        } else {
+            direction = nil
+        }
+
+        guard direction != shelfAutoScrollDirection else { return }
+        stopShelfAutoScroll()
+        shelfAutoScrollDirection = direction
+        guard let direction else { return }
+
+        shelfMarqueeAccumulatedIDs.formUnion(selectedShelfItemIDs.subtracting(shelfMarqueeBaseSelection))
+        autoScrollShelf(direction: direction, using: scrollProxy)
+        shelfAutoScrollTask = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(90))
+                guard !Task.isCancelled else { return }
+                autoScrollShelf(direction: direction, using: scrollProxy)
+            }
+        }
+    }
+
+    private func autoScrollShelf(direction: ShelfAutoScrollDirection, using scrollProxy: ScrollViewProxy) {
+        guard isShelfMarqueeAllowed == true,
+              shelfAutoScrollDirection == direction,
+              shelfViewportWidth > 0 else { return }
+        let orderedIDs = store.folders.map(\.id)
+        let visibleIDs = Set(shelfItemFrames.compactMap { id, frame in
+            frame.maxX > 0 && frame.minX < shelfViewportWidth ? id : nil
+        })
+        guard let targetID = ShelfAutoScrollTargetResolver.resolve(
+            direction: direction,
+            orderedIDs: orderedIDs,
+            visibleIDs: visibleIDs
+        ) else { return }
+
+        shelfMarqueeAccumulatedIDs.insert(targetID)
+        selectedShelfItemIDs = shelfMarqueeBaseSelection.union(shelfMarqueeAccumulatedIDs)
+        withAnimation(.linear(duration: 0.08)) {
+            scrollProxy.scrollTo(targetID, anchor: direction == .backward ? .leading : .trailing)
+        }
+        controller.keepOpen()
+    }
+
+    private func stopShelfAutoScroll() {
+        shelfAutoScrollTask?.cancel()
+        shelfAutoScrollTask = nil
+        shelfAutoScrollDirection = nil
+    }
+
+    private func selectionRect(from start: CGPoint, to current: CGPoint) -> CGRect {
+        let minimumThickness: CGFloat = 4
+        let minX = min(start.x, current.x)
+        let minY = min(start.y, current.y)
+        let width = max(abs(current.x - start.x), minimumThickness)
+        let height = max(abs(current.y - start.y), minimumThickness)
+        return CGRect(
+            x: current.x >= start.x ? minX : minX - (width - abs(current.x - start.x)),
+            y: current.y >= start.y ? minY : minY - (height - abs(current.y - start.y)),
+            width: width,
+            height: height
+        )
+    }
+
+    private func endShelfMarquee() {
+        stopShelfAutoScroll()
+        shelfMarqueeStart = nil
+        shelfMarqueeCurrent = nil
+        shelfMarqueeBaseSelection = []
+        shelfMarqueeAccumulatedIDs = []
+        isShelfMarqueeAllowed = nil
     }
 }
 
@@ -338,7 +644,6 @@ private struct FolderSetTab: View {
         .frame(height: 23)
         .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         .onTapGesture { if !isEditing { select() } }
-        .onTapGesture(count: 2, perform: startEditing)
         .contextMenu {
             Button {
                 startEditing()
@@ -346,7 +651,7 @@ private struct FolderSetTab: View {
                 Label("Rename Set…", systemImage: "pencil")
             }
         }
-        .help(isEditing ? "Press Return to save" : "Click to switch. Double-click to rename.")
+        .help(isEditing ? "Press Return to save" : "Click to switch. Right-click to rename.")
         .onDrag {
             startDrag()
             return NSItemProvider(object: set.id.uuidString as NSString)
@@ -372,27 +677,86 @@ private struct FolderSetTab: View {
 
 private struct FolderTile: View {
     let folder: SavedFolder
+    let isSelected: Bool
     @ObservedObject var store: FolderStore
     @ObservedObject var controller: DockController
+    let primaryAction: () -> Void
+    let actionItems: () -> [SavedFolder]
+    let onContextMenu: () -> Void
     let onStartDrag: () -> Void
+    let onEndDrag: () -> Void
     let onReceiveDrop: ([URL]) -> Bool
-    private var tags: [FinderTag] { FinderTag.tags(for: folder.url) }
+    @State private var tags: [FinderTag] = []
+    private var contextActions: [PointerContextAction] {
+        let targets = actionItems()
+        let urls = targets.map(\.url)
+        let count = targets.count
+        let suffix = count > 1 ? " (\(count) Items)" : ""
 
-    var body: some View {
-        PointerButton(
-            primaryAction: { controller.browse(folder) },
-            middleAction: { controller.openInNewFinderWindow(folder) },
-            dragURL: folder.url,
-            dragStarted: onStartDrag,
-            receiveDrop: onReceiveDrop,
-            contextActions: [
+        if count > 1 {
+            var actions = [
+                PointerContextAction(title: "Open\(suffix)", systemImageName: "arrow.up.forward.app", action: { store.open(targets) }),
+                PointerContextAction(title: "Quick Look\(suffix)", systemImageName: "eye", action: { controller.quickLook(urls) }),
+                PointerContextAction(title: "Show in Finder\(suffix)", systemImageName: "scope", action: { store.showInFinder(targets) }),
+                PointerContextAction(title: "Copy Paths\(suffix)", systemImageName: "link", action: { controller.copyPaths(urls) })
+            ]
+            if targets.allSatisfy(\.isDirectory) {
+                actions.insert(
+                    PointerContextAction(title: "Open in New Finder Windows\(suffix)", systemImageName: "macwindow.badge.plus", action: {
+                        targets.forEach(controller.openInNewFinderWindow)
+                    }),
+                    at: 1
+                )
+            }
+            actions.append(PointerContextAction(title: "-", action: {}))
+            actions.append(PointerContextAction(
+                title: "Remove from Dock\(suffix)",
+                systemImageName: "minus.circle",
+                isDestructive: true,
+                action: { store.remove(targets) }
+            ))
+            return actions
+        }
+
+        if folder.isDirectory {
+            return [
                 PointerContextAction(title: "Browse Here", systemImageName: "folder", action: { controller.browse(folder) }),
                 PointerContextAction(title: "Open in Finder", systemImageName: "arrow.up.forward.app", action: { store.open(folder) }),
                 PointerContextAction(title: "Open in New Finder Window", systemImageName: "macwindow.badge.plus", action: { controller.openInNewFinderWindow(folder) }),
                 PointerContextAction(title: "Show in Finder", systemImageName: "scope", action: { store.showInFinder(folder) }),
+                PointerContextAction(title: "Copy Path", systemImageName: "link", action: { controller.copyPath(folder.url) }),
                 PointerContextAction(title: "-", action: {}),
                 PointerContextAction(title: "Remove from Dock", systemImageName: "minus.circle", isDestructive: true, action: { store.remove(folder) })
             ]
+        }
+
+        return [
+            PointerContextAction(title: "Open", systemImageName: "arrow.up.forward.app", action: { store.open(folder) }),
+            PointerContextAction(title: "Quick Look", systemImageName: "eye", action: { controller.quickLook([folder.url]) }),
+            PointerContextAction(title: "Show in Finder", systemImageName: "scope", action: { store.showInFinder(folder) }),
+            PointerContextAction(title: "Copy Path", systemImageName: "link", action: { controller.copyPath(folder.url) }),
+            PointerContextAction(title: "-", action: {}),
+            PointerContextAction(title: "Remove from Dock", systemImageName: "minus.circle", isDestructive: true, action: { store.remove(folder) })
+        ]
+    }
+
+    var body: some View {
+        PointerButton(
+            primaryAction: primaryAction,
+            doubleAction: { controller.browse(folder) },
+            middleAction: {
+                if folder.isDirectory {
+                    controller.openInNewFinderWindow(folder)
+                } else {
+                    store.open(folder)
+                }
+            },
+            dragURLs: { actionItems().map(\.url) },
+            dragStarted: onStartDrag,
+            dragEnded: { _ in onEndDrag() },
+            receiveDrop: onReceiveDrop,
+            contextMenuStarted: onContextMenu,
+            contextActions: contextActions
         ) {
             VStack(spacing: 4) {
                 FileIcon(url: folder.url, size: 29, tint: tags.first?.color)
@@ -408,8 +772,34 @@ private struct FolderTile: View {
             .padding(.horizontal, 3)
             .frame(width: 66, height: 48)
             .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .background(
+                isSelected ? Color.accentColor.opacity(0.24) : .clear,
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(isSelected ? Color.accentColor.opacity(0.9) : .clear, lineWidth: 1)
+            }
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: ShelfItemFramesPreferenceKey.self,
+                        value: [folder.id: proxy.frame(in: .named("savedShelf"))]
+                    )
+                }
+            }
         }
-        .help("Click to browse. Middle-click to open a new Finder window.")
+        .task(id: folder.path) {
+            let url = folder.url
+            let loadedTags = await Task.detached(priority: .userInitiated) {
+                FinderTag.tags(for: url)
+            }.value
+            guard !Task.isCancelled else { return }
+            tags = loadedTags
+        }
+        .help(folder.isDirectory
+            ? "Click to select. Double-click to browse. Command-click or Shift-click selects multiple items."
+            : "Click to select. Double-click to open. Command-click or Shift-click selects multiple items.")
     }
 }
 
@@ -632,13 +1022,15 @@ private struct FolderBrowser: View {
                     Text(folder.lastPathComponent)
                         .font(.system(size: 13, weight: .semibold))
                         .lineLimit(1)
-                    Text(folder.path)
-                        .font(.system(size: 9))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    CopyablePathLabel(path: folder.path) {
+                        controller.keepOpen()
+                    }
+                    .frame(minWidth: 0, maxWidth: .infinity, minHeight: 16, maxHeight: 16)
+                    .clipped()
                 }
                 .frame(minWidth: 72, maxWidth: .infinity, alignment: .leading)
                 .layoutPriority(-1)
+                .clipped()
 
                 TextField("Search", text: $searchText)
                     .textFieldStyle(.roundedBorder)

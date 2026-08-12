@@ -5,14 +5,26 @@ struct SavedFolder: Codable, Identifiable, Hashable {
     let id: UUID
     var name: String
     var path: String
+    fileprivate var directoryHint: Bool?
 
     init(url: URL) {
         id = UUID()
         name = url.lastPathComponent
         path = url.path
+        var isDirectory: ObjCBool = false
+        directoryHint = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+            ? isDirectory.boolValue
+            : nil
     }
 
-    var url: URL { URL(fileURLWithPath: path, isDirectory: true) }
+    var url: URL { URL(fileURLWithPath: path) }
+
+    var isDirectory: Bool {
+        if let directoryHint { return directoryHint }
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
 }
 
 struct FolderSet: Codable, Identifiable, Hashable {
@@ -80,8 +92,10 @@ final class FolderStore: ObservableObject {
     }
 
     func selectSet(_ set: FolderSet) {
+        guard selectedSetID != set.id,
+              folderSets.contains(where: { $0.id == set.id }) else { return }
         selectedSetID = set.id
-        persist()
+        persistSelection()
     }
 
     func createSet(named rawName: String) {
@@ -117,7 +131,7 @@ final class FolderStore: ObservableObject {
 
     func add(url: URL, toSetID setID: UUID) {
         let url = url.standardizedFileURL
-        guard url.hasDirectoryPath,
+        guard FileManager.default.fileExists(atPath: url.path),
               let index = folderSets.firstIndex(where: { $0.id == setID }),
               !folderSets[index].folders.contains(where: { $0.path == url.path }) else { return }
         folderSets[index].folders.append(SavedFolder(url: url))
@@ -125,9 +139,24 @@ final class FolderStore: ObservableObject {
     }
 
     func remove(_ folder: SavedFolder) {
-        guard let index = folderSets.firstIndex(where: { $0.id == selectedSetID }) else { return }
-        folderSets[index].folders.removeAll { $0.id == folder.id }
+        remove([folder])
+    }
+
+    func remove(_ folders: [SavedFolder]) {
+        let ids = Set(folders.map(\.id))
+        guard !ids.isEmpty,
+              let index = folderSets.firstIndex(where: { $0.id == selectedSetID }) else { return }
+        folderSets[index].folders.removeAll { ids.contains($0.id) }
         persist()
+    }
+
+    func open(_ folders: [SavedFolder]) {
+        folders.forEach { NSWorkspace.shared.open($0.url) }
+    }
+
+    func showInFinder(_ folders: [SavedFolder]) {
+        guard !folders.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(folders.map(\.url))
     }
 
     func moveSet(_ movingID: UUID, before targetID: UUID) {
@@ -141,27 +170,43 @@ final class FolderStore: ObservableObject {
     }
 
     func moveFolder(_ movingID: UUID, before targetID: UUID) {
-        guard movingID != targetID,
-              let setIndex = folderSets.firstIndex(where: { $0.id == selectedSetID }),
-              let source = folderSets[setIndex].folders.firstIndex(where: { $0.id == movingID }),
-              let target = folderSets[setIndex].folders.firstIndex(where: { $0.id == targetID }) else { return }
-        let folder = folderSets[setIndex].folders.remove(at: source)
-        let destination = source < target ? target - 1 : target
-        folderSets[setIndex].folders.insert(folder, at: destination)
+        moveFolders([movingID], before: targetID)
+    }
+
+    func moveFolders(_ movingIDs: [UUID], before targetID: UUID) {
+        let movingSet = Set(movingIDs)
+        guard !movingSet.isEmpty,
+              !movingSet.contains(targetID),
+              let setIndex = folderSets.firstIndex(where: { $0.id == selectedSetID }) else { return }
+
+        let movingItems = folderSets[setIndex].folders.filter { movingSet.contains($0.id) }
+        guard !movingItems.isEmpty else { return }
+        folderSets[setIndex].folders.removeAll { movingSet.contains($0.id) }
+        let destination = folderSets[setIndex].folders.firstIndex(where: { $0.id == targetID })
+            ?? folderSets[setIndex].folders.endIndex
+        folderSets[setIndex].folders.insert(contentsOf: movingItems, at: destination)
         persist()
     }
 
     func open(_ folder: SavedFolder) {
-        NSWorkspace.shared.open(folder.url)
+        open([folder])
     }
 
     func showInFinder(_ folder: SavedFolder) {
-        NSWorkspace.shared.activateFileViewerSelecting([folder.url])
+        showInFinder([folder])
     }
 
     private static func removingMissingFolders(from set: FolderSet) -> FolderSet {
         var set = set
-        set.folders.removeAll { !FileManager.default.fileExists(atPath: $0.path) }
+        set.folders = set.folders.compactMap { savedItem -> SavedFolder? in
+            var savedItem = savedItem
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: savedItem.path, isDirectory: &isDirectory) else {
+                return nil
+            }
+            savedItem.directoryHint = isDirectory.boolValue
+            return savedItem
+        }
         return set
     }
 
@@ -172,6 +217,10 @@ final class FolderStore: ObservableObject {
     private func persist() {
         guard let data = try? JSONEncoder().encode(folderSets) else { return }
         UserDefaults.standard.set(data, forKey: setsDefaultsKey)
+        persistSelection()
+    }
+
+    private func persistSelection() {
         UserDefaults.standard.set(selectedSetID.uuidString, forKey: selectedSetDefaultsKey)
     }
 }
