@@ -20,6 +20,8 @@ struct FolderDockGuardrails {
         missingOrderedSelectionFallsBackToClickedItem()
         autoScrollAdvancesPastVisibleItems()
         autoScrollStopsAtCollectionEdges()
+        recursiveSearchKeepsSharedAncestorHierarchy()
+        recursiveSearchMarksOnlyActualMatches()
         print("Folder Dock guardrails passed")
     }
 
@@ -79,6 +81,36 @@ struct FolderDockGuardrails {
             ShelfAutoScrollTargetResolver.resolve(direction: .forward, orderedIDs: ids, visibleIDs: allVisible) == nil,
             "forward marquee auto-scroll passed the last item"
         )
+    }
+
+    private static func recursiveSearchKeepsSharedAncestorHierarchy() {
+        let tree = SearchPathTreeBuilder.build(
+            matchingPaths: [
+                ["Project", "Assets", "Images", "logo.png"],
+                ["Project", "Assets", "Audio", "logo-theme.mp3"],
+                ["Project", "Exports", "logo-final.mov"]
+            ],
+            sortedBy: { $0.localizedStandardCompare($1) == .orderedAscending }
+        )
+        require(tree.map(\.value) == ["Project"], "recursive search duplicated the shared root")
+        require(
+            tree[0].children.map(\.value) == ["Assets", "Exports"],
+            "recursive search attached results to the wrong branch"
+        )
+        require(
+            tree[0].children[0].children.map(\.value) == ["Audio", "Images"],
+            "recursive search lost nested sibling branches"
+        )
+    }
+
+    private static func recursiveSearchMarksOnlyActualMatches() {
+        let tree = SearchPathTreeBuilder.build(
+            matchingPaths: [["Parent", "Match.txt"], ["Parent", "Match.txt"]],
+            sortedBy: <
+        )
+        require(!tree[0].isMatch, "recursive search marked an ancestor as a result")
+        require(tree[0].children.count == 1, "recursive search duplicated the same result")
+        require(tree[0].children[0].isMatch, "recursive search failed to mark the actual result")
     }
 
     private static func resolve(clicked: Item, selected: Set<UUID>, ordered: [Item]) -> [Item] {

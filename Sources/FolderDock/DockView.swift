@@ -815,6 +815,40 @@ private struct BrowserItem: Identifiable, Sendable, Equatable {
     var name: String { url.lastPathComponent }
 }
 
+private struct RecursiveSearchNode: Identifiable, Sendable, Equatable {
+    let item: BrowserItem
+    let isMatch: Bool
+    let children: [RecursiveSearchNode]
+
+    var id: URL { item.url }
+}
+
+private struct RecursiveSearchRow: Identifiable {
+    let node: RecursiveSearchNode
+    let depth: Int
+
+    var id: URL { node.id }
+}
+
+private enum BrowserSearchScope: String, CaseIterable, Identifiable {
+    case currentFolder
+    case subfolders
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .currentFolder: "This Folder"
+        case .subfolders: "All Subfolders"
+        }
+    }
+}
+
+private struct RecursiveSearchScan: Sendable {
+    let roots: [RecursiveSearchNode]
+    let matchCount: Int
+    let wasLimited: Bool
+}
+
 private struct FinderTag: Hashable, Sendable {
     let name: String
     let colorIndex: Int
@@ -966,6 +1000,15 @@ private struct FolderBrowser: View {
     @State private var activeDropTargetIDs: Set<String> = []
     @State private var dropFocusGeneration = UUID()
     @State private var searchText = ""
+    @State private var searchScope = BrowserSearchScope.currentFolder
+    @State private var recursiveSearchRoots: [RecursiveSearchNode] = []
+    @State private var recursiveMatchCount = 0
+    @State private var recursiveSearchWasLimited = false
+    @State private var isRecursiveSearchLoading = false
+    @State private var recursiveSearchError: String?
+    @State private var recursiveSearchRequestID = UUID()
+    @State private var expandedSearchFolders: Set<URL> = []
+    @State private var recursiveSearchTask: Task<Void, Never>?
     @State private var directoryRefreshTimer: Timer?
     @State private var loadRequestID = UUID()
     @State private var loadInFlightPath: String?
@@ -983,6 +1026,8 @@ private struct FolderBrowser: View {
     var body: some View {
         let displayedItems = visibleItems
         let displayedURLs = displayedItems.map(\.url)
+        let recursiveRows = flattenedRecursiveSearchRows
+        let recursiveURLs = recursiveRows.map { $0.node.item.url }
 
         VStack(spacing: 0) {
             HStack(spacing: 10) {
@@ -1031,12 +1076,6 @@ private struct FolderBrowser: View {
                 .frame(minWidth: 72, maxWidth: .infinity, alignment: .leading)
                 .layoutPriority(-1)
                 .clipped()
-
-                TextField("Search", text: $searchText)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 10))
-                    .frame(width: 118)
-                    .help("Filter this folder")
 
                 Button(action: controller.createNewFolder) {
                     Image(systemName: "folder.badge.plus")
@@ -1092,6 +1131,27 @@ private struct FolderBrowser: View {
 
             Divider()
 
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11))
+                    .help(searchScope == .subfolders ? "Search this folder and all subfolders" : "Filter this folder")
+                Picker("Search scope", selection: $searchScope) {
+                    ForEach(BrowserSearchScope.allCases) { scope in
+                        Text(scope.title).tag(scope)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 210)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 44)
+
+            Divider()
+
             if isBatchRenaming {
                 BatchRenameBar(controller: controller)
                 Divider()
@@ -1108,6 +1168,8 @@ private struct FolderBrowser: View {
                         .controlSize(.small)
                 } else if let loadError {
                     ContentUnavailableView("Couldn't open this folder", systemImage: "exclamationmark.triangle", description: Text(loadError))
+                } else if isRecursiveSearchActive {
+                    recursiveSearchView(rows: recursiveRows, orderedURLs: recursiveURLs)
                 } else if items.isEmpty && !isCreatingFolder {
                     ContentUnavailableView("This folder is empty", systemImage: "folder")
                 } else {
@@ -1170,6 +1232,11 @@ private struct FolderBrowser: View {
             directoryRefreshTimer = nil
             loadRequestID = UUID()
             loadInFlightPath = nil
+            recursiveSearchRequestID = UUID()
+            recursiveSearchTask?.cancel()
+            recursiveSearchTask = nil
+            recursiveSearchRoots = []
+            isRecursiveSearchLoading = false
             activeDropTargetIDs.removeAll()
             browserDropFocus = false
         }
@@ -1179,13 +1246,24 @@ private struct FolderBrowser: View {
             loadedFolderPath = nil
             loadError = nil
             searchText = ""
+            recursiveSearchRequestID = UUID()
+            recursiveSearchTask?.cancel()
+            recursiveSearchTask = nil
+            recursiveSearchRoots = []
+            recursiveMatchCount = 0
+            recursiveSearchError = nil
+            expandedSearchFolders = []
             controller.updateCurrentDirectoryItems([])
             loadItems()
         }
-        .onChange(of: controller.directoryRevision) { _, _ in loadItems() }
+        .onChange(of: controller.directoryRevision) { _, _ in
+            loadItems()
+            if isRecursiveSearchActive { scheduleRecursiveSearch() }
+        }
         .onChange(of: sortKeyValue) { _, _ in updateSelectionOrder() }
         .onChange(of: sortAscending) { _, _ in updateSelectionOrder() }
-        .onChange(of: searchText) { _, _ in updateSelectionOrder() }
+        .onChange(of: searchText) { _, _ in searchInputChanged() }
+        .onChange(of: searchScope) { _, _ in searchInputChanged() }
     }
 
     private func loadItems(showLoading: Bool = true) {
@@ -1300,6 +1378,108 @@ private struct FolderBrowser: View {
         }
     }
 
+    nonisolated private static func searchRecursively(
+        in root: URL,
+        query: String,
+        maximumMatches: Int = 500,
+        maximumVisitedItems: Int = 20_000
+    ) -> Result<RecursiveSearchScan, DirectoryLoadFailure> {
+        let resourceKeys: Set<URLResourceKey> = [
+            .isDirectoryKey,
+            .isHiddenKey,
+            .isPackageKey,
+            .fileSizeKey,
+            .contentModificationDateKey,
+            .tagNamesKey
+        ]
+        let rootComponentCount = root.standardizedFileURL.pathComponents.count
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsHiddenFiles, .skipsPackageDescendants],
+            errorHandler: { _, _ in true }
+        ) else {
+            return .failure(.message("This folder could not be searched."))
+        }
+
+        var matchingPaths: [[URL]] = []
+        var itemByURL: [URL: BrowserItem] = [:]
+        var matchCount = 0
+        var visitedCount = 0
+        var wasLimited = false
+
+        while let url = enumerator.nextObject() as? URL {
+            if Task.isCancelled { break }
+            visitedCount += 1
+            if visitedCount > maximumVisitedItems {
+                wasLimited = true
+                break
+            }
+            let values = try? url.resourceValues(forKeys: resourceKeys)
+            if values?.isHidden == true { continue }
+            let isDirectory = values?.isDirectory ?? false
+            if isDirectory && values?.isPackage == true {
+                enumerator.skipDescendants()
+            }
+            let kind = isDirectory
+                ? "Folder"
+                : (url.pathExtension.isEmpty ? "Document" : url.pathExtension.uppercased())
+            let isMatch = url.lastPathComponent.localizedCaseInsensitiveContains(query)
+                || kind.localizedCaseInsensitiveContains(query)
+            guard isMatch else { continue }
+
+            if matchCount == maximumMatches {
+                wasLimited = true
+                break
+            }
+            matchCount += 1
+
+            let relativeComponents = Array(url.standardizedFileURL.pathComponents.dropFirst(rootComponentCount))
+            guard !relativeComponents.isEmpty else { continue }
+            var parentURL = root
+            var componentPath: [URL] = []
+            for (index, component) in relativeComponents.enumerated() {
+                let componentURL = parentURL.appendingPathComponent(component)
+                if itemByURL[componentURL] == nil {
+                    let isLeaf = index == relativeComponents.count - 1
+                    let componentValues = isLeaf ? values : (try? componentURL.resourceValues(forKeys: resourceKeys))
+                    let componentIsDirectory = componentValues?.isDirectory ?? !isLeaf
+                    let componentKind = componentIsDirectory
+                        ? "Folder"
+                        : (componentURL.pathExtension.isEmpty ? "Document" : componentURL.pathExtension.uppercased())
+                    itemByURL[componentURL] = BrowserItem(
+                        url: componentURL,
+                        isDirectory: componentIsDirectory,
+                        kind: componentKind,
+                        size: componentValues?.fileSize ?? 0,
+                        modificationDate: componentValues?.contentModificationDate,
+                        tags: FinderTag.tags(
+                            for: componentURL,
+                            knownTagNames: componentValues?.tagNames ?? []
+                        )
+                    )
+                }
+                componentPath.append(componentURL)
+                parentURL = componentURL
+            }
+            matchingPaths.append(componentPath)
+        }
+
+        let pathTree = SearchPathTreeBuilder.build(matchingPaths: matchingPaths) {
+            $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+        }
+        func makeNode(_ treeNode: SearchPathTreeNode<URL>) -> RecursiveSearchNode? {
+            guard let item = itemByURL[treeNode.value] else { return nil }
+            return RecursiveSearchNode(
+                item: item,
+                isMatch: treeNode.isMatch,
+                children: treeNode.children.compactMap(makeNode)
+            )
+        }
+        let frozenRoots = pathTree.compactMap(makeNode)
+        return .success(RecursiveSearchScan(roots: frozenRoots, matchCount: matchCount, wasLimited: wasLimited))
+    }
+
     private func listView(items displayedItems: [BrowserItem], orderedURLs displayedURLs: [URL]) -> some View {
         GeometryReader { proxy in
             ScrollView(.horizontal, showsIndicators: true) {
@@ -1355,6 +1535,163 @@ private struct FolderBrowser: View {
                 .frame(width: max(tableWidth, proxy.size.width), height: proxy.size.height, alignment: .topLeading)
             }
         }
+    }
+
+    @ViewBuilder
+    private func recursiveSearchView(rows: [RecursiveSearchRow], orderedURLs: [URL]) -> some View {
+        if isRecursiveSearchLoading && recursiveSearchRoots.isEmpty {
+            ProgressView("Searching subfolders…")
+                .controlSize(.small)
+        } else if let recursiveSearchError {
+            ContentUnavailableView(
+                "Search failed",
+                systemImage: "exclamationmark.triangle",
+                description: Text(recursiveSearchError)
+            )
+        } else if rows.isEmpty {
+            ContentUnavailableView.search(text: normalizedSearchQuery)
+        } else {
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    Text("\(recursiveMatchCount) result\(recursiveMatchCount == 1 ? "" : "s")")
+                    if recursiveSearchWasLimited {
+                        Label("Results limited", systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.orange)
+                    }
+                    Spacer()
+                    if isRecursiveSearchLoading {
+                        ProgressView().controlSize(.mini)
+                    }
+                    Button("Expand All") { expandedSearchFolders = recursiveFolderURLs }
+                        .buttonStyle(.plain)
+                    Button("Collapse All") { expandedSearchFolders = [] }
+                        .buttonStyle(.plain)
+                }
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 16)
+                .frame(height: 30)
+                Divider()
+
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(rows) { row in
+                            RecursiveSearchResultRow(
+                                row: row,
+                                orderedURLs: orderedURLs,
+                                isExpanded: expandedSearchFolders.contains(row.node.id),
+                                controller: controller,
+                                onDropFocusChanged: {
+                                    updateDropFocus(for: row.node.id.path, isTargeted: $0)
+                                },
+                                toggleExpansion: {
+                                    if expandedSearchFolders.contains(row.node.id) {
+                                        expandedSearchFolders.remove(row.node.id)
+                                    } else {
+                                        expandedSearchFolders.insert(row.node.id)
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    .padding(8)
+                }
+            }
+        }
+    }
+
+    private var normalizedSearchQuery: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var isRecursiveSearchActive: Bool {
+        searchScope == .subfolders && !normalizedSearchQuery.isEmpty
+    }
+
+    private func searchInputChanged() {
+        if isRecursiveSearchActive {
+            scheduleRecursiveSearch()
+        } else {
+            recursiveSearchTask?.cancel()
+            recursiveSearchTask = nil
+            recursiveSearchRequestID = UUID()
+            recursiveSearchRoots = []
+            recursiveMatchCount = 0
+            recursiveSearchError = nil
+            recursiveSearchWasLimited = false
+            isRecursiveSearchLoading = false
+            expandedSearchFolders = []
+            updateSelectionOrder()
+        }
+    }
+
+    private func scheduleRecursiveSearch() {
+        recursiveSearchTask?.cancel()
+        let query = normalizedSearchQuery
+        guard !query.isEmpty, searchScope == .subfolders else { return }
+        let requestID = UUID()
+        recursiveSearchRequestID = requestID
+        isRecursiveSearchLoading = true
+        recursiveSearchError = nil
+        recursiveSearchTask = Task {
+            try? await Task.sleep(for: .milliseconds(220))
+            guard !Task.isCancelled, requestID == recursiveSearchRequestID else { return }
+            let scanTask = Task.detached(priority: .userInitiated) {
+                Self.searchRecursively(in: folder, query: query)
+            }
+            let result = await withTaskCancellationHandler {
+                await scanTask.value
+            } onCancel: {
+                scanTask.cancel()
+            }
+            guard !Task.isCancelled, requestID == recursiveSearchRequestID else { return }
+            isRecursiveSearchLoading = false
+            switch result {
+            case let .success(scan):
+                recursiveSearchRoots = scan.roots
+                recursiveMatchCount = scan.matchCount
+                recursiveSearchWasLimited = scan.wasLimited
+                recursiveSearchError = nil
+                expandedSearchFolders = Self.folderURLs(in: scan.roots)
+                updateSelectionOrder()
+            case let .failure(.message(message)):
+                recursiveSearchRoots = []
+                recursiveMatchCount = 0
+                recursiveSearchWasLimited = false
+                recursiveSearchError = message
+                controller.updateCurrentDirectoryItems([])
+            }
+        }
+    }
+
+    private var flattenedRecursiveSearchRows: [RecursiveSearchRow] {
+        var rows: [RecursiveSearchRow] = []
+        func append(_ nodes: [RecursiveSearchNode], depth: Int) {
+            for node in nodes {
+                rows.append(RecursiveSearchRow(node: node, depth: depth))
+                if expandedSearchFolders.contains(node.id) {
+                    append(node.children, depth: depth + 1)
+                }
+            }
+        }
+        append(recursiveSearchRoots, depth: 0)
+        return rows
+    }
+
+    private var recursiveFolderURLs: Set<URL> {
+        Self.folderURLs(in: recursiveSearchRoots)
+    }
+
+    nonisolated private static func folderURLs(in nodes: [RecursiveSearchNode]) -> Set<URL> {
+        var urls: Set<URL> = []
+        func collect(_ nodes: [RecursiveSearchNode]) {
+            for node in nodes where node.item.isDirectory && !node.children.isEmpty {
+                urls.insert(node.id)
+                collect(node.children)
+            }
+        }
+        collect(nodes)
+        return urls
     }
 
     private var nameWidth: CGFloat { CGFloat(nameColumnWidth) }
@@ -1416,7 +1753,11 @@ private struct FolderBrowser: View {
     }
 
     private func updateSelectionOrder() {
-        controller.updateCurrentDirectoryItems(visibleItems.map(\.url))
+        if isRecursiveSearchActive {
+            controller.updateCurrentDirectoryItems(flattenedRecursiveSearchRows.map { $0.node.item.url })
+        } else {
+            controller.updateCurrentDirectoryItems(visibleItems.map(\.url))
+        }
     }
 }
 
@@ -1919,6 +2260,100 @@ private struct BrowserListRow: View {
                 .buttonStyle(.plain)
                 .help("Browse this folder")
                 .offset(x: 20 + nameWidth - 24)
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: $isFileDropTarget) { providers in
+            guard item.isDirectory else { return false }
+            return controller.receiveFileDrop(providers, into: item.url)
+        }
+        .onChange(of: isFileDropTarget) { _, targeted in
+            onDropFocusChanged(targeted)
+        }
+        .onDisappear {
+            if isFileDropTarget {
+                onDropFocusChanged(false)
+            }
+        }
+    }
+
+    private func urlsForDrag() -> [URL] {
+        if !controller.selectedItemURLs.contains(item.url) {
+            controller.selectOnly(item.url)
+        }
+        return controller.selectedItemsOr(item.url)
+    }
+}
+
+private struct RecursiveSearchResultRow: View {
+    let row: RecursiveSearchRow
+    let orderedURLs: [URL]
+    let isExpanded: Bool
+    @ObservedObject var controller: DockController
+    let onDropFocusChanged: (Bool) -> Void
+    let toggleExpansion: () -> Void
+    @State private var isFileDropTarget = false
+
+    private var item: BrowserItem { row.node.item }
+    private var isSelected: Bool { controller.selectedItemURLs.contains(item.url) }
+
+    var body: some View {
+        FinderDragSource(
+            urls: urlsForDrag,
+            primaryAction: { controller.selectItem(item.url, orderedURLs: orderedURLs) },
+            doubleAction: { controller.openInBrowser(item.url) },
+            dragEnded: controller.externalFileDragEnded,
+            contextMenu: { makeFileItemContextMenu(item: item, controller: controller) }
+        ) {
+            HStack(spacing: 8) {
+                Color.clear.frame(width: 18, height: 26)
+
+                if item.isDirectory {
+                    FileIcon(url: item.url, size: 22, tint: item.tags.first?.color)
+                } else {
+                    FilePreview(url: item.url, size: 22, modificationDate: item.modificationDate)
+                }
+
+                Text(item.name)
+                    .font(.system(size: 12, weight: row.node.isMatch ? .semibold : .regular))
+                    .lineLimit(1)
+                FinderTagDots(tags: item.tags)
+                Spacer(minLength: 8)
+                if row.node.isMatch {
+                    Image(systemName: "magnifyingglass.circle.fill")
+                        .foregroundStyle(Color.accentColor)
+                        .help("Matches search")
+                }
+                Text(item.isDirectory ? "Folder" : item.kind)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 74, alignment: .leading)
+            }
+            .padding(.leading, CGFloat(row.depth) * 20)
+        }
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, minHeight: 34, maxHeight: 34, alignment: .leading)
+        .contentShape(Rectangle())
+        .background {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(isSelected ? Color.accentColor.opacity(0.20) : (row.node.isMatch ? Color.accentColor.opacity(0.06) : .clear))
+        }
+        .overlay {
+            if item.isDirectory && isFileDropTarget {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(Color.accentColor, lineWidth: 2)
+            }
+        }
+        .overlay(alignment: .leading) {
+            if item.isDirectory && !row.node.children.isEmpty {
+                Button(action: toggleExpansion) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 18, height: 26)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 10 + CGFloat(row.depth) * 20)
+                .help(isExpanded ? "Collapse folder" : "Expand folder")
             }
         }
         .onDrop(of: [.fileURL], isTargeted: $isFileDropTarget) { providers in

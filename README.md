@@ -49,6 +49,8 @@ The Sparkle private Ed25519 key is stored in the macOS Keychain under the `ed255
 
 When browsing a saved folder, click once to select an item and double-click to open it.
 
+The browser search bar can filter **This Folder** or search **All Subfolders**. Recursive results are shown as an expandable folder tree, so each match remains visible in its actual folder hierarchy instead of appearing as a detached flat result.
+
 You can drag any saved file, folder, or browser item directly into another app, including file-upload targets. Dragging an item back onto the shelf adds it to the active folder set.
 
 On the saved-item shelf, drag from empty space to draw a selection box across items. Hold the pointer near or beyond either horizontal edge while dragging to auto-scroll through longer sets. You can also use `Command`-click to toggle individual items or `Shift`-click to select a range. Drag any highlighted item to send the complete selection to Finder, an upload field, or another app.

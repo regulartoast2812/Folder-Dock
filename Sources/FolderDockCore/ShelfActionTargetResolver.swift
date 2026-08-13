@@ -37,3 +37,62 @@ public enum ShelfAutoScrollTargetResolver {
         }
     }
 }
+
+public struct SearchPathTreeNode<Value: Hashable & Sendable>: Sendable, Equatable {
+    public let value: Value
+    public let isMatch: Bool
+    public let children: [SearchPathTreeNode<Value>]
+
+    public init(value: Value, isMatch: Bool, children: [SearchPathTreeNode<Value>]) {
+        self.value = value
+        self.isMatch = isMatch
+        self.children = children
+    }
+}
+
+private final class MutableSearchPathTreeNode<Value: Hashable & Sendable> {
+    let value: Value
+    var isMatch = false
+    var children: [Value: MutableSearchPathTreeNode<Value>] = [:]
+
+    init(value: Value) {
+        self.value = value
+    }
+
+    func frozen(sortedBy order: (Value, Value) -> Bool) -> SearchPathTreeNode<Value> {
+        SearchPathTreeNode(
+            value: value,
+            isMatch: isMatch,
+            children: children.values
+                .sorted { order($0.value, $1.value) }
+                .map { $0.frozen(sortedBy: order) }
+        )
+    }
+}
+
+public enum SearchPathTreeBuilder {
+    public static func build<Value: Hashable & Sendable>(
+        matchingPaths: [[Value]],
+        sortedBy areInIncreasingOrder: (Value, Value) -> Bool
+    ) -> [SearchPathTreeNode<Value>] {
+        var roots: [Value: MutableSearchPathTreeNode<Value>] = [:]
+        for path in matchingPaths where !path.isEmpty {
+            var parent: MutableSearchPathTreeNode<Value>?
+            for (index, value) in path.enumerated() {
+                let existing = parent?.children[value] ?? roots[value]
+                let node = existing ?? MutableSearchPathTreeNode(value: value)
+                if existing == nil {
+                    if let parent {
+                        parent.children[value] = node
+                    } else {
+                        roots[value] = node
+                    }
+                }
+                if index == path.indices.last { node.isMatch = true }
+                parent = node
+            }
+        }
+        return roots.values.sorted { areInIncreasingOrder($0.value, $1.value) }
+            .map { $0.frozen(sortedBy: areInIncreasingOrder) }
+    }
+}
