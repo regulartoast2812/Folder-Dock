@@ -22,6 +22,7 @@ struct FolderDockGuardrails {
         autoScrollStopsAtCollectionEdges()
         recursiveSearchKeepsSharedAncestorHierarchy()
         recursiveSearchMarksOnlyActualMatches()
+        recursiveFileSearchFindsNestedMatches()
         print("Folder Dock guardrails passed")
     }
 
@@ -111,6 +112,32 @@ struct FolderDockGuardrails {
         require(!tree[0].isMatch, "recursive search marked an ancestor as a result")
         require(tree[0].children.count == 1, "recursive search duplicated the same result")
         require(tree[0].children[0].isMatch, "recursive search failed to mark the actual result")
+    }
+
+    private static func recursiveFileSearchFindsNestedMatches() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FolderDockRecursiveSearch-\(UUID().uuidString)")
+        let nestedFolder = root
+            .appendingPathComponent("Donna Marie")
+            .appendingPathComponent("Fitting")
+        let matchingFile = nestedFolder.appendingPathComponent("Size M - Black white.mov")
+        let ignoredFile = root.appendingPathComponent("green.mov")
+        do {
+            try FileManager.default.createDirectory(at: nestedFolder, withIntermediateDirectories: true)
+            try Data().write(to: matchingFile)
+            try Data().write(to: ignoredFile)
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let result = try RecursiveFileSearcher.search(in: root, query: "black")
+            require(result.matchCount == 1, "recursive file search returned the wrong match count")
+            require(
+                result.matchingPaths.first?.map(\.lastPathComponent)
+                    == ["Donna Marie", "Fitting", "Size M - Black white.mov"],
+                "recursive file search lost the nested ancestor path"
+            )
+        } catch {
+            require(false, "recursive file search fixture failed: \(error)")
+        }
     }
 
     private static func resolve(clicked: Item, selected: Set<UUID>, ordered: [Item]) -> [Item] {

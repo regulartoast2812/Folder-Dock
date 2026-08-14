@@ -1386,64 +1386,28 @@ private struct FolderBrowser: View {
     ) -> Result<RecursiveSearchScan, DirectoryLoadFailure> {
         let resourceKeys: Set<URLResourceKey> = [
             .isDirectoryKey,
-            .isHiddenKey,
-            .isPackageKey,
             .fileSizeKey,
             .contentModificationDateKey,
             .tagNamesKey
         ]
-        let rootComponentCount = root.standardizedFileURL.pathComponents.count
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: Array(resourceKeys),
-            options: [.skipsHiddenFiles, .skipsPackageDescendants],
-            errorHandler: { _, _ in true }
-        ) else {
+        let scan: RecursiveFileSearchResult
+        do {
+            scan = try RecursiveFileSearcher.search(
+                in: root,
+                query: query,
+                maximumMatches: maximumMatches,
+                maximumVisitedItems: maximumVisitedItems
+            )
+        } catch {
             return .failure(.message("This folder could not be searched."))
         }
 
-        var matchingPaths: [[URL]] = []
         var itemByURL: [URL: BrowserItem] = [:]
-        var matchCount = 0
-        var visitedCount = 0
-        var wasLimited = false
-
-        while let url = enumerator.nextObject() as? URL {
-            if Task.isCancelled { break }
-            visitedCount += 1
-            if visitedCount > maximumVisitedItems {
-                wasLimited = true
-                break
-            }
-            let values = try? url.resourceValues(forKeys: resourceKeys)
-            if values?.isHidden == true { continue }
-            let isDirectory = values?.isDirectory ?? false
-            if isDirectory && values?.isPackage == true {
-                enumerator.skipDescendants()
-            }
-            let kind = isDirectory
-                ? "Folder"
-                : (url.pathExtension.isEmpty ? "Document" : url.pathExtension.uppercased())
-            let isMatch = url.lastPathComponent.localizedCaseInsensitiveContains(query)
-                || kind.localizedCaseInsensitiveContains(query)
-            guard isMatch else { continue }
-
-            if matchCount == maximumMatches {
-                wasLimited = true
-                break
-            }
-            matchCount += 1
-
-            let relativeComponents = Array(url.standardizedFileURL.pathComponents.dropFirst(rootComponentCount))
-            guard !relativeComponents.isEmpty else { continue }
-            var parentURL = root
-            var componentPath: [URL] = []
-            for (index, component) in relativeComponents.enumerated() {
-                let componentURL = parentURL.appendingPathComponent(component)
+        for componentPath in scan.matchingPaths {
+            for componentURL in componentPath {
                 if itemByURL[componentURL] == nil {
-                    let isLeaf = index == relativeComponents.count - 1
-                    let componentValues = isLeaf ? values : (try? componentURL.resourceValues(forKeys: resourceKeys))
-                    let componentIsDirectory = componentValues?.isDirectory ?? !isLeaf
+                    let componentValues = try? componentURL.resourceValues(forKeys: resourceKeys)
+                    let componentIsDirectory = componentValues?.isDirectory ?? false
                     let componentKind = componentIsDirectory
                         ? "Folder"
                         : (componentURL.pathExtension.isEmpty ? "Document" : componentURL.pathExtension.uppercased())
@@ -1459,13 +1423,10 @@ private struct FolderBrowser: View {
                         )
                     )
                 }
-                componentPath.append(componentURL)
-                parentURL = componentURL
             }
-            matchingPaths.append(componentPath)
         }
 
-        let pathTree = SearchPathTreeBuilder.build(matchingPaths: matchingPaths) {
+        let pathTree = SearchPathTreeBuilder.build(matchingPaths: scan.matchingPaths) {
             $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
         }
         func makeNode(_ treeNode: SearchPathTreeNode<URL>) -> RecursiveSearchNode? {
@@ -1477,7 +1438,11 @@ private struct FolderBrowser: View {
             )
         }
         let frozenRoots = pathTree.compactMap(makeNode)
-        return .success(RecursiveSearchScan(roots: frozenRoots, matchCount: matchCount, wasLimited: wasLimited))
+        return .success(RecursiveSearchScan(
+            roots: frozenRoots,
+            matchCount: scan.matchCount,
+            wasLimited: scan.wasLimited
+        ))
     }
 
     private func listView(items displayedItems: [BrowserItem], orderedURLs displayedURLs: [URL]) -> some View {
